@@ -540,7 +540,8 @@ def _perform_login(session: requests.Session, email: str, password: str,
                    device_id: str, code_verifier: str,
                    emitter: EventEmitter, mail_provider, otp_token: str,
                    proxy_str: str,
-                   stop_event: Optional[threading.Event] = None) -> Optional[dict]:
+                   stop_event: Optional[threading.Event] = None,
+                   used_otp_codes: Optional[set] = None) -> Optional[dict]:
     """
     纯 HTTP OAuth 登录换 Token（移植自 codexgen perform_codex_oauth_login_http）
 
@@ -613,7 +614,7 @@ def _perform_login(session: requests.Session, email: str, password: str,
         return None
 
     if resp.status_code != 200:
-        emitter.error(f"[登录] 邮箱提交失败: HTTP {resp.status_code}", step="login")
+        emitter.error(f"[登录] 邮箱提交失败: HTTP {resp.status_code} {_response_preview(resp)}", step="login")
         return None
 
     page_type = ""
@@ -673,42 +674,59 @@ def _perform_login(session: requests.Session, email: str, password: str,
             emitter.error("[登录] 无 mail_provider/otp_token，无法接收验证码", step="login_otp")
             return None
 
-        # 服务端已自动发送 OTP，直接等待
-        try:
-            otp_code = mail_provider.wait_for_otp(
-                otp_token, email, proxy=proxy_str, stop_event=stop_event,
-            )
-        except TypeError:
-            otp_code = mail_provider.wait_for_otp(
-                otp_token, email, proxy=proxy_str,
-            )
-        if not otp_code:
-            emitter.error("[登录] 验证码等待超时", step="login_otp")
-            return None
-
-        emitter.info(f"[登录] 验证码: {otp_code}", step="login_otp")
+        # 循环拿验证码并尝试，跳过注册阶段已用过的旧验证码
+        tried_codes = set(used_otp_codes or [])
+        otp_ok = False
+        otp_deadline = time.time() + 120
 
         h_val = dict(COMMON_HEADERS)
         h_val["referer"] = f"{AUTH_BASE}/email-verification"
         h_val["oai-device-id"] = login_device_id
         h_val.update(_generate_datadog_trace())
 
-        resp = login_session.post(
-            f"{AUTH_BASE}/api/accounts/email-otp/validate",
-            json={"code": otp_code},
-            headers=h_val, verify=False, timeout=30,
-        )
-        if resp.status_code != 200:
-            emitter.error(f"[登录] OTP 验证失败: {resp.status_code}", step="login_otp")
-            return None
+        while time.time() < otp_deadline and not otp_ok:
+            if stop_event and stop_event.is_set():
+                return None
 
-        emitter.success("[登录] OTP 验证成功", step="login_otp")
-        try:
-            data = resp.json()
-            continue_url = data.get("continue_url", "")
-            page_type = data.get("page", {}).get("type", "")
-        except Exception:
-            pass
+            try:
+                otp_code = mail_provider.wait_for_otp(
+                    otp_token, email, proxy=proxy_str, stop_event=stop_event,
+                )
+            except TypeError:
+                otp_code = mail_provider.wait_for_otp(
+                    otp_token, email, proxy=proxy_str,
+                )
+
+            if not otp_code or otp_code in tried_codes:
+                time.sleep(2)
+                continue
+
+            tried_codes.add(otp_code)
+            emitter.info(f"[登录] 尝试验证码: {otp_code}", step="login_otp")
+
+            resp = login_session.post(
+                f"{AUTH_BASE}/api/accounts/email-otp/validate",
+                json={"code": otp_code},
+                headers=h_val, verify=False, timeout=30,
+            )
+
+            if resp.status_code == 200:
+                otp_ok = True
+                emitter.success(f"[登录] OTP 验证成功: {otp_code}", step="login_otp")
+                try:
+                    data = resp.json()
+                    continue_url = data.get("continue_url", "")
+                    page_type = data.get("page", {}).get("type", "")
+                except Exception:
+                    pass
+                break
+            else:
+                emitter.info(f"[登录] 验证码 {otp_code} 失败: {resp.status_code} {_response_preview(resp)}", step="login_otp")
+                time.sleep(2)
+
+        if not otp_ok:
+            emitter.error("[登录] OTP 验证超时，所有验证码均失败", step="login_otp")
+            return None
 
         # 如果进入 about-you
         if "about-you" in continue_url:
@@ -1091,7 +1109,7 @@ def run_v3(
             if resp.status_code in (301, 302):
                 redirect_url = resp.headers.get('Location', '')
                 if 'email-otp' not in redirect_url and 'email-verification' not in redirect_url:
-                    emitter.error(f"用户注册失败: HTTP {resp.status_code}", step="register")
+                    emitter.error(f"用户注册失败: HTTP {resp.status_code} {_response_preview(resp)}", step="register")
                     return None
             else:
                 emitter.error(f"用户注册失败: HTTP {resp.status_code} {_response_preview(resp)}", step="register")
@@ -1226,6 +1244,7 @@ def run_v3(
             otp_token=otp_token,
             proxy_str=proxy_str,
             stop_event=stop_event,
+            used_otp_codes={otp_code},
         )
 
         if not token_data:
