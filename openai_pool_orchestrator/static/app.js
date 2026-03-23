@@ -962,11 +962,13 @@ function getRequestedWorkerCount() {
 async function startTask() {
   const proxy = DOM.proxyInput.value.trim();
   const worker_count = getRequestedWorkerCount();
+  const targetEl = document.getElementById('targetCountInput');
+  const target_count = targetEl ? Math.max(0, parseInt(targetEl.value, 10) || 0) : 0;
   try {
     const res = await fetch('/api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ proxy, worker_count }),
+      body: JSON.stringify({ proxy, worker_count, target_count }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -975,7 +977,8 @@ async function startTask() {
     }
     applyStatusSnapshot(data, { force: true });
     const workerMsg = worker_count > 1 ? ` (${worker_count} 线程)` : '';
-    showToast('注册任务已启动' + workerMsg, 'success');
+    const targetMsg = target_count > 0 ? ` 目标 ${target_count} 个` : '';
+    showToast('注册任务已启动' + workerMsg + targetMsg, 'success');
   } catch (e) {
     showToast('启动请求失败: ' + e.message, 'error');
   }

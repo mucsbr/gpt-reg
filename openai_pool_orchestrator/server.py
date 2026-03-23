@@ -1702,6 +1702,7 @@ def _get_sub2api_maintainer(cfg: Optional[Dict[str, Any]] = None) -> Optional[Su
 class StartRequest(BaseModel):
     proxy: str = ""
     worker_count: int = 1
+    target_count: int = 0
 
 
 class ProxyCheckRequest(BaseModel):
@@ -1767,7 +1768,7 @@ async def index() -> HTMLResponse:
 @app.post("/api/start")
 async def api_start(req: StartRequest) -> Dict[str, Any]:
     try:
-        _state.start_task(req.proxy, req.worker_count)
+        _state.start_task(req.proxy, req.worker_count, target_count=req.target_count)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     snapshot = _state.get_status_snapshot()
