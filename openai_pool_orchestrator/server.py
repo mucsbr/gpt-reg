@@ -3120,7 +3120,7 @@ def _try_auto_register() -> None:
             "step": "auto_register",
         })
         return
-    if _state.status != "idle":
+    if _state.status not in ("idle", "stopped", "finished", "failed"):
         _state.broadcast({
             "ts": ts, "level": "info",
             "message": f"[AUTO] 跳过自动注册：当前状态 {_state.status}",
@@ -3243,7 +3243,7 @@ def _start_auto_maintain() -> None:
                         _state.broadcast({
                             "ts": datetime.now().strftime("%H:%M:%S"),
                             "level": "success",
-                            "message": f"[POOL] 自动维护完成: 池内 {candidates} 个账号全部健康（总文件 {total}）",
+                            "message": f"[POOL] 自动维护完成: 池内 {candidates}/{pm.min_candidates} 个账号全部健康",
                             "step": "pool_auto",
                         })
                     else:
@@ -3251,7 +3251,7 @@ def _start_auto_maintain() -> None:
                             "ts": datetime.now().strftime("%H:%M:%S"),
                             "level": "info",
                             "message": (
-                                f"[POOL] 自动维护完成: 总 {candidates}, 健康 {healthy}, "
+                                f"[POOL] 自动维护完成: 总 {candidates}/{pm.min_candidates}, 健康 {healthy}, "
                                 f"无效 {invalid_count}, 已删除 {deleted_ok}"
                                 + (f", 删除失败 {deleted_fail}" if deleted_fail else "")
                             ),
