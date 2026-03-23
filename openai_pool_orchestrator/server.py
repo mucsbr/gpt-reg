@@ -1798,6 +1798,25 @@ async def api_save_proxy(req: ProxySaveRequest) -> Dict[str, str]:
     return {"status": "saved"}
 
 
+class TaskControlRequest(BaseModel):
+    multithread: Optional[bool] = None
+    thread_count: Optional[int] = None
+    auto_register: Optional[bool] = None
+
+
+@app.post("/api/task-control")
+async def api_save_task_control(req: TaskControlRequest) -> Dict[str, str]:
+    cfg = _get_sync_config()
+    if req.multithread is not None:
+        cfg["multithread"] = req.multithread
+    if req.thread_count is not None:
+        cfg["thread_count"] = max(1, min(req.thread_count, 10))
+    if req.auto_register is not None:
+        cfg["auto_register"] = req.auto_register
+    _save_sync_config(cfg)
+    return {"status": "saved"}
+
+
 @app.get("/api/proxy")
 async def api_get_proxy() -> Dict[str, Any]:
     cfg = _get_sync_config()

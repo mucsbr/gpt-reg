@@ -299,6 +299,11 @@ document.addEventListener('DOMContentLoaded', () => {
   DOM.clearLogBtn.addEventListener('click', clearLog);
   if (DOM.unlockFocusBtn) DOM.unlockFocusBtn.addEventListener('click', unlockFocusWorker);
 
+  // 任务控制区开关/输入变更时自动保存
+  if (DOM.multithreadCheck) DOM.multithreadCheck.addEventListener('change', saveTaskControl);
+  if (DOM.threadCountInput) DOM.threadCountInput.addEventListener('change', saveTaskControl);
+  if (DOM.autoRegisterCheck) DOM.autoRegisterCheck.addEventListener('change', saveTaskControl);
+
   DOM.saveSyncConfigBtn.addEventListener('click', saveSyncConfig);
   if (DOM.uploadModeSaveBtn) DOM.uploadModeSaveBtn.addEventListener('click', saveUploadMode);
   DOM.cpaTestBtn.addEventListener('click', testCpaConnection);
@@ -948,6 +953,25 @@ async function saveProxy() {
   } catch (e) {
     showToast('保存请求失败: ' + e.message, 'error');
   }
+}
+
+// ==========================================
+// 任务控制设置自动保存
+// ==========================================
+async function saveTaskControl() {
+  const multithread = DOM.multithreadCheck ? DOM.multithreadCheck.checked : false;
+  const thread_count = DOM.threadCountInput ? parseInt(DOM.threadCountInput.value, 10) || 3 : 3;
+  const auto_register = DOM.autoRegisterCheck ? DOM.autoRegisterCheck.checked : false;
+  try {
+    const res = await fetch('/api/task-control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ multithread, thread_count, auto_register }),
+    });
+    if (res.ok) {
+      showToast('任务控制配置已保存', 'success');
+    }
+  } catch { }
 }
 
 // ==========================================
