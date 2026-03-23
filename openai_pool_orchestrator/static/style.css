@@ -125,14 +125,7 @@ body {
 }
 
 body::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  z-index: 999;
-  pointer-events: none;
-  background-image: var(--watermark-svg);
-  background-repeat: repeat;
-  background-size: 420px 240px;
+  display: none;
 }
 
 /* ---------- Scrollbar — Thin & Subtle ---------- */
