@@ -6,5 +6,4 @@ services:
     restart: unless-stopped
     network_mode: host
     volumes:
-      - /opt/openai-pool/data:/app/data
-      - /opt/openai-pool/config:/app/config
+      - ./data:/app/data

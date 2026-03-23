@@ -32,15 +32,21 @@ from .register import EventEmitter, _fetch_proxy_from_pool
 from .mail_providers import create_provider, MultiMailRouter
 from .pool_maintainer import PoolMaintainer, Sub2ApiMaintainer
 
-# 动态导入注册函数
+# 动态导入注册函数（每次调用时读取配置，支持热切换）
 def _get_run_function():
-    """根据配置选择注册函数"""
+    """根据配置选择注册函数（支持 v1/v2/v3 动态切换）"""
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    if cfg.get("use_register_v2", False):
+
+    version = cfg.get("use_register_version", "v1").lower()
+
+    if version == "v2":
         from .register_v2 import run_v2
         return run_v2
-    else:
+    elif version == "v3":
+        from .register_v3 import run_v3
+        return run_v3
+    else:  # v1 或其他值默认用 v1
         from .register import run
         return run
 
@@ -2905,7 +2911,7 @@ class MailConfigRequest(BaseModel):
     mail_providers: List[str] = []
     mail_provider_configs: Dict[str, Dict[str, str]] = {}
     mail_strategy: str = "round_robin"
-    use_register_v2: Optional[bool] = None
+    use_register_version: Optional[str] = None
 
 
 @app.get("/api/pool/config")
@@ -3025,7 +3031,7 @@ async def api_get_mail_config() -> Dict[str, Any]:
         "mail_providers": cfg.get("mail_providers", []),
         "mail_provider_configs": safe_configs,
         "mail_strategy": cfg.get("mail_strategy", "round_robin"),
-        "use_register_v2": cfg.get("use_register_v2", False),
+        "use_register_version": cfg.get("use_register_version", "v1"),
     }
 
 
@@ -3049,8 +3055,10 @@ async def api_set_mail_config(req: MailConfigRequest) -> Dict[str, Any]:
     cfg["mail_provider_configs"] = existing_configs
 
     # 保存注册流程版本配置
-    if req.use_register_v2 is not None:
-        cfg["use_register_v2"] = req.use_register_v2
+    if req.use_register_version is not None:
+        version = str(req.use_register_version).lower()
+        if version in ("v1", "v2", "v3"):
+            cfg["use_register_version"] = version
 
     _save_sync_config(cfg)
     return {"status": "saved"}

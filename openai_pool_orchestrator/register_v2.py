@@ -175,6 +175,22 @@ class SentinelGen:
 
 
 # ==========================================
+# 浏览器请求头（模拟 Chrome 145）
+# ==========================================
+
+BROWSER_HEADERS = {
+    "accept": "application/json",
+    "accept-language": "en-US,en;q=0.9",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    "sec-ch-ua": '"Google Chrome";v="145", "Not?A_Brand";v="8", "Chromium";v="145"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+}
+
+# ==========================================
 # 核心注册 + 登录流程（双会话模式）
 # ==========================================
 
@@ -542,7 +558,7 @@ def run_v2(
 
         csrf_resp = session_get(
             f"{_chatgpt_base}/api/auth/csrf",
-            headers={"Accept": "application/json", "Referer": f"{_chatgpt_base}/"},
+            headers={**BROWSER_HEADERS, "referer": f"{_chatgpt_base}/"},
             timeout=15,
         )
         try:
@@ -841,10 +857,13 @@ def run_v2(
             return json.dumps({"p": p_val, "t": "", "c": c_val, "id": did2, "flow": flow}, separators=(",", ":"))
 
         def _oauth_headers(referer):
-            h = {
-                "Accept": "application/json", "Content-Type": "application/json",
-                "Origin": "https://auth.openai.com", "Referer": referer, "oai-device-id": did2,
-            }
+            h = dict(BROWSER_HEADERS)
+            h.update({
+                "content-type": "application/json",
+                "origin": "https://auth.openai.com",
+                "referer": referer,
+                "oai-device-id": did2,
+            })
             h.update(_trace_headers())
             return h
 

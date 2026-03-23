@@ -1,7 +1,7 @@
 # ========================================
 # OpenAI Pool Orchestrator  Docker 镜像
 # ========================================
-FROM python:3.12-slim
+FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/python:3.12-slim
 
 # 禁用缓冲，让 Python 日志立即输出到 docker logs 终端
 ENV PYTHONUNBUFFERED=1

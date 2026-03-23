@@ -207,7 +207,7 @@ document.addEventListener('DOMContentLoaded', () => {
     mailTestBtn: $('mailTestBtn'),
     mailSaveBtn: $('mailSaveBtn'),
     mailStatus: $('mailStatus'),
-    useRegisterV2Toggle: $('useRegisterV2Toggle'),
+    registerVersionSelect: $('registerVersionSelect'),
     registerVersionSaveBtn: $('registerVersionSaveBtn'),
     registerVersionStatus: $('registerVersionStatus'),
     poolTotal: $('poolTotal'),
@@ -2558,9 +2558,10 @@ async function loadMailConfig() {
 
     if (DOM.mailStrategySelect) DOM.mailStrategySelect.value = strategy;
 
-    // 加载 use_register_v2 配置
-    if (DOM.useRegisterV2Toggle) {
-      DOM.useRegisterV2Toggle.checked = data.use_register_v2 || false;
+    // 加载 use_register_version 配置
+    if (DOM.registerVersionSelect) {
+      const version = data.use_register_version || "v1";
+      DOM.registerVersionSelect.value = version;
     }
   } catch { }
 }
@@ -2647,14 +2648,14 @@ async function saveRegisterVersion() {
   DOM.registerVersionSaveBtn.disabled = true;
   DOM.registerVersionStatus.textContent = '保存中...';
   try {
-    const useV2 = DOM.useRegisterV2Toggle.checked;
+    const version = DOM.registerVersionSelect.value;
     const res = await fetch('/api/mail/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ use_register_v2: useV2 }),
+      body: JSON.stringify({ use_register_version: version }),
     });
     if (res.ok) {
-      showToast(`已切换到 ${useV2 ? 'V2' : 'V1'} 注册流程`, 'success');
+      showToast(`已切换到 ${version.toUpperCase()} 注册流程（无需重启）`, 'success');
       DOM.registerVersionStatus.textContent = '已保存';
     } else {
       const data = await res.json();
