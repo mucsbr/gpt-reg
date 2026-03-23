@@ -1009,6 +1009,7 @@ class TaskState:
             self.worker_count = n
             self.upload_mode = upload_mode
             self.target_count = max(0, target_count)
+            self._target_reached = False
             self.run_success_count = 0
             self.run_fail_count = 0
             self.platform_success_count = {name: 0 for name in UPLOAD_PLATFORMS}
@@ -1133,10 +1134,12 @@ class TaskState:
                     should_stop = self.target_count > 0 and self.run_success_count >= self.target_count
                 if should_stop:
                     emitter.success(
-                        f"{prefix}本轮已达目标 {self.target_count} 个，自动停止",
+                        f"{prefix}本轮已达目标 {self.target_count} 个，不再启动新注册（等待进行中的 Worker 完成）",
                         step="auto_stop",
                     )
-                    self.stop_event.set()
+                    # 标记达到目标，但不立即 set stop_event
+                    # worker 循环顶部会检查此标志，不再启动新注册
+                    self._target_reached = True
             else:
                 with self._task_lock:
                     self.fail_count += 1
@@ -1354,6 +1357,10 @@ class TaskState:
             worker_emitter = emitter.bind(worker_id=worker_id, worker_label=worker_label)
             count = 0
             while not self.stop_event.is_set():
+                # 达到目标数量后不再启动新注册，让当前 worker 正常退出
+                if self._target_reached:
+                    worker_emitter.info(f"{prefix}已达目标数量，不再启动新注册", step="auto_stop")
+                    break
                 if _decoupled_slots_exhausted():
                     worker_emitter.info(f"{prefix}双平台目标已满足，停止新增注册", step="auto_stop")
                     self.stop_event.set()
