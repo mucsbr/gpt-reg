@@ -1,0 +1,37 @@
+{
+  "auto_register": true,
+  "proxy": "",
+  "proxy_pool": {
+    "enabled": false,
+    "api_url": "",
+    "auth_mode": "query",
+    "api_key": "",
+    "count": 1,
+    "country": "US"
+  },
+  "upload_mode": "snapshot",
+  "cpa": {
+    "enabled": true,
+    "base_url": "",
+    "token": "",
+    "target_type": "codex",
+    "min_candidates": 800,
+    "used_percent_threshold": 95
+  },
+  "sub2api": {
+    "enabled": true,
+    "base_url": "",
+    "bearer_token": "",
+    "email": "",
+    "password": "",
+    "min_candidates": 200,
+    "auto_sync": true
+  },
+  "token_store": {
+    "dir": "./tokens"
+  },
+  "register": {
+    "bridge_to_repo": true,
+    "target_count": 1
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "proxy": "",
+  "auto_register": false,
+  "mail_providers": [
+    "mailtm"
+  ],
+  "mail_provider_configs": {
+    "mailtm": {
+      "api_base": "https://api.mail.tm"
+    },
+    "duckmail": {
+      "api_base": "https://api.duckmail.sbs"
+    },
+    "moemail": {
+      "api_base": "",
+      "api_key": ""
+    },
+    "cloudflare_temp_email": {
+      "api_base": "https://cloudflare_temp_email.mucsbr.workers.dev",
+      "admin_password": "Nc484&ds1tyyz",
+      "domain": "[openclaude.ccwu.cc, peacebeings.top, openclaude.de5.net, claudex.ccwu.cc]"
+    }
+  },
+  "mail_strategy": "round_robin",
+  "multithread": false,
+  "thread_count": 3,
+  "base_url": "",
+  "bearer_token": "",
+  "email": "",
+  "password": "",
+  "account_name": "AutoReg",
+  "auto_sync": false,
+  "sub2api_min_candidates": 200,
+  "sub2api_auto_maintain": false,
+  "sub2api_maintain_interval_minutes": 30,
+  "sub2api_maintain_actions": {
+    "refresh_abnormal_accounts": true,
+    "delete_abnormal_accounts": true,
+    "dedupe_duplicate_accounts": true
+  },
+  "cpa_base_url": "https://cli-proxy-api-latest-jazr.onrender.com",
+  "cpa_token": "sk-Nc484&ds1tyyz",
+  "min_candidates": 1000,
+  "used_percent_threshold": 95,
+  "auto_maintain": true,
+  "maintain_interval_minutes": 30,
+  "upload_mode": "snapshot",
+  "proxy_pool_enabled": false,
+  "proxy_pool_api_url": "https://zenproxy.top/api/fetch",
+  "proxy_pool_auth_mode": "header",
+  "proxy_pool_api_key": "使用自己的Key",
+  "proxy_pool_count": 1,
+  "proxy_pool_country": "US"
+}

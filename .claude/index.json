@@ -1,0 +1,121 @@
+{
+  "timestamp": "2026-03-18T09:19:57",
+  "project": "openai-pool-orchestrator",
+  "version": "2.0.0",
+  "language": "Python",
+  "python_requires": ">=3.10",
+  "license": "MIT",
+  "root_claude_md": "CLAUDE.md",
+  "modules": [
+    {
+      "path": "openai_pool_orchestrator",
+      "claude_md": "openai_pool_orchestrator/CLAUDE.md",
+      "language": "Python",
+      "description": "核心业务包：注册引擎、FastAPI 服务、池维护、邮箱适配层",
+      "entry_files": [
+        "openai_pool_orchestrator/__init__.py",
+        "openai_pool_orchestrator/__main__.py"
+      ],
+      "key_files": [
+        "openai_pool_orchestrator/server.py",
+        "openai_pool_orchestrator/register.py",
+        "openai_pool_orchestrator/pool_maintainer.py",
+        "openai_pool_orchestrator/mail_providers.py"
+      ],
+      "api_definition": "openai_pool_orchestrator/server.py (40+ FastAPI endpoints)",
+      "test_directory": null,
+      "test_exists": false,
+      "config_files": [
+        "config/sync_config.example.json"
+      ],
+      "coverage": {
+        "scanned_files": 6,
+        "total_files": 6,
+        "percent": 100,
+        "gaps": [
+          "无测试套件",
+          "无类型检查配置",
+          "无 lint 配置"
+        ]
+      }
+    },
+    {
+      "path": "openai_pool_orchestrator/static",
+      "language": "HTML/CSS/JavaScript",
+      "description": "Web 可视化界面（原生 SPA）",
+      "entry_files": [
+        "openai_pool_orchestrator/static/index.html"
+      ],
+      "key_files": [
+        "openai_pool_orchestrator/static/app.js",
+        "openai_pool_orchestrator/static/style.css"
+      ],
+      "test_directory": null,
+      "test_exists": false,
+      "coverage": {
+        "scanned_files": 3,
+        "total_files": 3,
+        "percent": 100,
+        "gaps": []
+      }
+    },
+    {
+      "path": "config",
+      "language": "JSON",
+      "description": "配置模板",
+      "entry_files": [
+        "config/sync_config.example.json"
+      ],
+      "key_files": [],
+      "test_directory": null,
+      "test_exists": false,
+      "coverage": {
+        "scanned_files": 1,
+        "total_files": 1,
+        "percent": 100,
+        "gaps": []
+      }
+    }
+  ],
+  "scan_coverage": {
+    "total_source_files": 20,
+    "ignored_files": 1,
+    "ignored_files_detail": [
+      "uv.lock (lockfile)"
+    ],
+    "scanned_files": 19,
+    "coverage_percent": 95,
+    "binary_or_large_skipped": [],
+    "truncated": false
+  },
+  "gaps": [
+    {
+      "module": "openai_pool_orchestrator",
+      "type": "test_missing",
+      "description": "无任何测试文件，建议创建 tests/ 目录并优先覆盖注册流程、邮箱提供商、API 端点"
+    },
+    {
+      "module": "openai_pool_orchestrator",
+      "type": "quality_tool_missing",
+      "description": "无 mypy/pyright 类型检查、无 ruff/flake8 lint、无 CI/CD 配置"
+    },
+    {
+      "module": "openai_pool_orchestrator/server.py",
+      "type": "large_file",
+      "description": "server.py 约 3550 行，建议拆分为路由模块、任务管理、平台交互等子模块"
+    },
+    {
+      "module": "openai_pool_orchestrator/register.py",
+      "type": "large_file",
+      "description": "register.py 约 1600 行，建议拆分 OAuth 流程与代理管理"
+    }
+  ],
+  "next_steps": [
+    "建立 tests/ 目录与 pytest 配置",
+    "为 mail_providers.py 编写单元测试（最高优先级，接口清晰可测）",
+    "为 pool_maintainer.py 编写单元测试",
+    "拆分 server.py 为多个路由模块",
+    "添加 ruff 或 flake8 lint 配置",
+    "添加 mypy 类型检查"
+  ]
+}

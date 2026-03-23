@@ -1,0 +1,10 @@
+services:
+  openai-pool:
+    build: .
+    image: openai-pool-orchestrator:latest
+    container_name: openai-pool
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /opt/openai-pool/data:/app/data
+      - /opt/openai-pool/config:/app/config
