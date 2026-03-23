@@ -3210,34 +3210,70 @@ def _start_auto_maintain() -> None:
 
     def _loop(local_stop: threading.Event) -> None:
         while not local_stop.is_set():
+            ts = datetime.now().strftime("%H:%M:%S")
             pm = _get_pool_maintainer()
-            if pm:
-                if not _pool_maintain_lock.acquire(blocking=False):
+            if not pm:
+                _state.broadcast({
+                    "ts": ts, "level": "warn",
+                    "message": "[POOL] CPA 未配置（缺少 base_url 或 token），跳过自动维护",
+                    "step": "pool_auto",
+                })
+            elif not _pool_maintain_lock.acquire(blocking=False):
+                _state.broadcast({
+                    "ts": ts, "level": "warn",
+                    "message": "[POOL] 跳过自动维护：已有维护任务在执行",
+                    "step": "pool_auto",
+                })
+            else:
+                try:
                     _state.broadcast({
-                        "ts": datetime.now().strftime("%H:%M:%S"),
-                        "level": "warn",
-                        "message": "[POOL] 跳过自动维护：已有维护任务在执行",
+                        "ts": ts, "level": "info",
+                        "message": "[POOL] 开始 CPA 自动维护（探活+清理）...",
                         "step": "pool_auto",
                     })
-                else:
-                    try:
-                        result = pm.probe_and_clean_sync()
+                    result = pm.probe_and_clean_sync()
+                    total = result.get('total', 0)
+                    candidates = result.get('candidates', 0)
+                    invalid_count = result.get('invalid_count', 0)
+                    deleted_ok = result.get('deleted_ok', 0)
+                    deleted_fail = result.get('deleted_fail', 0)
+                    healthy = candidates - invalid_count
+
+                    if invalid_count == 0:
+                        _state.broadcast({
+                            "ts": datetime.now().strftime("%H:%M:%S"),
+                            "level": "success",
+                            "message": f"[POOL] 自动维护完成: 池内 {candidates} 个账号全部健康（总文件 {total}）",
+                            "step": "pool_auto",
+                        })
+                    else:
                         _state.broadcast({
                             "ts": datetime.now().strftime("%H:%M:%S"),
                             "level": "info",
-                            "message": f"[POOL] 自动维护: 无效 {result.get('invalid_count', 0)}, 已删除 {result.get('deleted_ok', 0)}",
+                            "message": (
+                                f"[POOL] 自动维护完成: 总 {candidates}, 健康 {healthy}, "
+                                f"无效 {invalid_count}, 已删除 {deleted_ok}"
+                                + (f", 删除失败 {deleted_fail}" if deleted_fail else "")
+                            ),
                             "step": "pool_auto",
                         })
-                    except Exception as e:
-                        _state.broadcast({
-                            "ts": datetime.now().strftime("%H:%M:%S"),
-                            "level": "error",
-                            "message": f"[POOL] 自动维护异常: {e}",
-                            "step": "pool_auto",
-                        })
-                    finally:
-                        _pool_maintain_lock.release()
-                    _try_auto_register()
+                except Exception as e:
+                    _state.broadcast({
+                        "ts": datetime.now().strftime("%H:%M:%S"),
+                        "level": "error",
+                        "message": f"[POOL] 自动维护异常: {e}",
+                        "step": "pool_auto",
+                    })
+                finally:
+                    _pool_maintain_lock.release()
+                _try_auto_register()
+
+            next_ts = datetime.now().strftime("%H:%M:%S")
+            _state.broadcast({
+                "ts": next_ts, "level": "info",
+                "message": f"[POOL] 下次自动维护: {interval // 60} 分钟后",
+                "step": "pool_auto",
+            })
             local_stop.wait(interval)
 
     thread = threading.Thread(target=_loop, args=(stop_event,), daemon=True)
