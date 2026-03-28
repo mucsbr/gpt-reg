@@ -36,6 +36,7 @@ from .register import (
     _to_proxies_dict,
     _fetch_proxy_from_pool,
     _proxy_tcp_reachable,
+    _augment_token_payload,
     _build_token_result,
     _write_text_atomic,
     _jwt_claims_no_verify,
@@ -527,6 +528,12 @@ def run_v2(
         # ------- 步骤2：创建临时邮箱 -------
         if mail_provider is not None:
             emitter.info("正在创建临时邮箱...", step="create_email")
+            mail_provider_name = str(
+                getattr(mail_provider, "provider_name", "")
+                or getattr(mail_provider, "name", "")
+                or emitter._defaults.get("mail_provider")
+                or ""
+            ).strip()
             try:
                 email, dev_token = mail_provider.create_mailbox(
                     proxy=static_proxy, proxy_selector=mail_proxy_selector,
@@ -535,6 +542,7 @@ def run_v2(
                 email, dev_token = mail_provider.create_mailbox(proxy=static_proxy)
         else:
             emitter.info("正在创建 Mail.tm 临时邮箱...", step="create_email")
+            mail_provider_name = "mailtm"
             email, dev_token = get_email_and_token(
                 static_proxies, emitter, proxy_selector=mail_proxies_selector,
             )
@@ -1200,7 +1208,12 @@ def run_v2(
                 s2.close()
             except Exception:
                 pass
-            return _build_token_result(_token_json, account_password=account_password)
+            return _augment_token_payload(
+                _build_token_result(_token_json, account_password=account_password),
+                account_password=account_password,
+                mail_provider_name=mail_provider_name,
+                mail_credential=dev_token,
+            )
 
         except Exception as e:
             emitter.error(f"登录阶段发生错误: {e}", step="get_token")

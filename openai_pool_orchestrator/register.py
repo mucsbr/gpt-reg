@@ -776,6 +776,23 @@ def _build_token_result(token_payload: Dict[str, Any], account_password: str = "
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
+def _augment_token_payload(
+    token_json: str,
+    *,
+    account_password: str = "",
+    mail_provider_name: str = "",
+    mail_credential: str = "",
+) -> str:
+    token_data = json.loads(token_json)
+    if account_password:
+        token_data["account_password"] = account_password
+    if mail_provider_name:
+        token_data["mail_provider"] = mail_provider_name
+    if mail_credential:
+        token_data["mail_credential"] = mail_credential
+    return json.dumps(token_data, ensure_ascii=False, separators=(",", ":"))
+
+
 def _write_text_atomic(file_path: str, content: str) -> None:
     directory = os.path.dirname(file_path) or "."
     os.makedirs(directory, exist_ok=True)
@@ -1273,7 +1290,12 @@ def run(
         except Exception:
             token_json = json.loads(str(token_resp.text or "{}"))
 
-        return _build_token_result(token_json, account_password=account_password)
+        return _augment_token_payload(
+            _build_token_result(token_json, account_password=account_password),
+            account_password=account_password,
+            mail_provider_name=mail_provider_name,
+            mail_credential=dev_token,
+        )
 
     def _stopped() -> bool:
         return stop_event is not None and stop_event.is_set()
@@ -1323,6 +1345,12 @@ def run(
         # ------- 步骤2：创建临时邮箱 -------
         if mail_provider is not None:
             emitter.info("正在创建临时邮箱...", step="create_email")
+            mail_provider_name = str(
+                getattr(mail_provider, "provider_name", "")
+                or getattr(mail_provider, "name", "")
+                or emitter._defaults.get("mail_provider")
+                or ""
+            ).strip()
             try:
                 email, dev_token = mail_provider.create_mailbox(
                     proxy=static_proxy,
@@ -1332,6 +1360,7 @@ def run(
                 email, dev_token = mail_provider.create_mailbox(proxy=static_proxy)
         else:
             emitter.info("正在创建 Mail.tm 临时邮箱...", step="create_email")
+            mail_provider_name = "mailtm"
             email, dev_token = get_email_and_token(
                 static_proxies,
                 emitter,
@@ -2014,7 +2043,12 @@ def run(
         emitter.success("Token 获取成功！", step="get_token")
         try: s.close()
         except: pass
-        return _build_token_result(_token_json, account_password=account_password)
+        return _augment_token_payload(
+            _build_token_result(_token_json, account_password=account_password),
+            account_password=account_password,
+            mail_provider_name=mail_provider_name,
+            mail_credential=dev_token,
+        )
 
     except Exception as e:
         emitter.error(f"运行时发生错误: {e}", step="runtime")

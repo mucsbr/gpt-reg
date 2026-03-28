@@ -24,6 +24,7 @@
   "mail_strategy": "round_robin",
   "multithread": false,
   "thread_count": 3,
+  "local_maintain_thread_count": 3,
   "base_url": "",
   "bearer_token": "",
   "email": "",

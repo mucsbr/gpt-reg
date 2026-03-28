@@ -16,7 +16,7 @@ import time
 import urllib.request
 import urllib.error
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
@@ -31,6 +31,7 @@ from . import __version__, TOKENS_DIR, CONFIG_FILE, STATE_FILE, STATIC_DIR, DATA
 from .register import EventEmitter, _fetch_proxy_from_pool
 from .mail_providers import create_provider, MultiMailRouter
 from .pool_maintainer import PoolMaintainer, Sub2ApiMaintainer
+from .local_pool_maintainer import LocalPoolMaintainer
 
 # 动态导入注册函数（每次调用时读取配置，支持热切换）
 def _get_run_function():
@@ -249,6 +250,11 @@ def _load_sync_config() -> Dict[str, Any]:
         "base_url": "", "bearer_token": "", "account_name": "AutoReg", "auto_sync": False,
         "cpa_base_url": "", "cpa_token": "", "min_candidates": 800,
         "used_percent_threshold": 95, "auto_maintain": False, "maintain_interval_minutes": 30,
+        "local_maintain_enabled": False,
+        "local_maintain_interval_minutes": 60,
+        "local_refresh_threshold_pct": 60,
+        "local_check_interval_hours": 6,
+        "local_maintain_thread_count": 3,
         "upload_mode": "snapshot",
         "mail_provider": "mailtm",
         "mail_config": {"api_base": "https://api.mail.tm", "api_key": "", "bearer_token": ""},
@@ -305,6 +311,7 @@ def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["auto_sync"] = _as_bool(cfg.get("auto_sync", False), default=False)
     cfg["auto_maintain"] = _as_bool(cfg.get("auto_maintain", False), default=False)
     cfg["sub2api_auto_maintain"] = _as_bool(cfg.get("sub2api_auto_maintain", False), default=False)
+    cfg["local_maintain_enabled"] = _as_bool(cfg.get("local_maintain_enabled", False), default=False)
     cfg["sub2api_maintain_actions"] = _normalize_sub2api_maintain_actions(cfg.get("sub2api_maintain_actions"))
     cfg["multithread"] = _as_bool(cfg.get("multithread", False), default=False)
     cfg["auto_register"] = _as_bool(cfg.get("auto_register", False), default=False)
@@ -312,6 +319,23 @@ def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         cfg["thread_count"] = max(1, min(int(cfg.get("thread_count", 3)), 10))
     except (ValueError, TypeError):
         cfg["thread_count"] = 3
+    try:
+        local_thread_count_raw = cfg.get("local_maintain_thread_count", cfg.get("thread_count", 3))
+        cfg["local_maintain_thread_count"] = max(1, min(int(local_thread_count_raw), 10))
+    except (ValueError, TypeError):
+        cfg["local_maintain_thread_count"] = cfg["thread_count"]
+    try:
+        cfg["local_maintain_interval_minutes"] = max(5, int(cfg.get("local_maintain_interval_minutes", 60) or 60))
+    except (TypeError, ValueError):
+        cfg["local_maintain_interval_minutes"] = 60
+    try:
+        cfg["local_refresh_threshold_pct"] = max(1, min(float(cfg.get("local_refresh_threshold_pct", 60) or 60), 100))
+    except (TypeError, ValueError):
+        cfg["local_refresh_threshold_pct"] = 60
+    try:
+        cfg["local_check_interval_hours"] = max(1, int(cfg.get("local_check_interval_hours", 6) or 6))
+    except (TypeError, ValueError):
+        cfg["local_check_interval_hours"] = 6
     cfg["proxy_pool_enabled"] = _as_bool(cfg.get("proxy_pool_enabled", True), default=True)
     proxy_pool_api_url = str(cfg.get("proxy_pool_api_url", "https://zenproxy.top/api/fetch") or "").strip()
     cfg["proxy_pool_api_url"] = proxy_pool_api_url or "https://zenproxy.top/api/fetch"
@@ -422,16 +446,30 @@ def _is_sub2api_uploaded(token_data: Dict[str, Any]) -> bool:
     return "sub2api" in _extract_uploaded_platforms(token_data)
 
 
+def _read_token_data(file_path: str) -> Dict[str, Any]:
+    with open(file_path, "r", encoding="utf-8") as f:
+        token_data = json.load(f)
+    return token_data if isinstance(token_data, dict) else {}
+
+
+def _update_token_file(file_path: str, updater) -> bool:
+    try:
+        token_data = _read_token_data(file_path)
+        updated = updater(dict(token_data))
+        if not isinstance(updated, dict):
+            return False
+        _write_json_atomic(Path(file_path), updated)
+        return True
+    except Exception:
+        return False
+
+
 def _mark_token_uploaded_platform(file_path: str, platform: str) -> bool:
     platform_name = str(platform).strip().lower()
     if platform_name not in UPLOAD_PLATFORMS:
         return False
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            token_data = json.load(f)
-        if not isinstance(token_data, dict):
-            return False
 
+    def _apply(token_data: Dict[str, Any]) -> Dict[str, Any]:
         platforms = _extract_uploaded_platforms(token_data)
         if platform_name not in platforms:
             platforms.append(platform_name)
@@ -440,18 +478,61 @@ def _mark_token_uploaded_platform(file_path: str, platform: str) -> bool:
         token_data[f"{platform_name}_synced"] = True
 
         if platform_name == "sub2api":
-            token_data["synced"] = True  # 兼容旧前端逻辑
+            token_data["synced"] = True
 
         uploaded_at = token_data.get("uploaded_at")
         if not isinstance(uploaded_at, dict):
             uploaded_at = {}
         uploaded_at[platform_name] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         token_data["uploaded_at"] = uploaded_at
+        return token_data
 
-        _write_json_atomic(Path(file_path), token_data)
-        return True
-    except Exception:
+    return _update_token_file(file_path, _apply)
+
+
+
+def _find_token_file_by_email(account_email: str) -> Optional[str]:
+    email = str(account_email or "").strip().lower()
+    if not email or not os.path.isdir(TOKENS_DIR):
+        return None
+    for fname in os.listdir(TOKENS_DIR):
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(TOKENS_DIR, fname)
+        try:
+            token_data = _read_token_data(fpath)
+        except Exception:
+            continue
+        if str(token_data.get("email") or "").strip().lower() == email:
+            return fpath
+    return None
+
+
+def _mark_local_token_status_by_email(
+    account_email: str,
+    *,
+    status: str,
+    next_check_at: Optional[datetime] = None,
+    last_used_percent: Optional[float] = None,
+) -> bool:
+    file_path = _find_token_file_by_email(account_email)
+    if not file_path:
         return False
+
+    def _apply(token_data: Dict[str, Any]) -> Dict[str, Any]:
+        token_data["local_status"] = status
+        if next_check_at is not None:
+            token_data["next_check_at"] = next_check_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            token_data.pop("next_check_at", None)
+        if last_used_percent is not None:
+            token_data["last_used_percent"] = round(float(last_used_percent), 2)
+        else:
+            token_data.pop("last_used_percent", None)
+        token_data.pop("local_recovered_status", None)
+        return token_data
+
+    return _update_token_file(file_path, _apply)
 
 
 # ==========================================
@@ -1665,6 +1746,9 @@ def request_service_shutdown() -> None:
 _auto_maintain_thread: Optional[threading.Thread] = None
 _auto_maintain_stop: Optional[threading.Event] = None
 _auto_maintain_ctl_lock = threading.Lock()
+_local_maintain_thread: Optional[threading.Thread] = None
+_local_maintain_stop: Optional[threading.Event] = None
+_local_maintain_ctl_lock = threading.Lock()
 _pool_maintain_lock = threading.Lock()
 
 
@@ -1680,6 +1764,11 @@ def _get_pool_maintainer(cfg: Optional[Dict[str, Any]] = None) -> Optional[PoolM
         min_candidates=int(cfg.get("min_candidates", 800)),
         used_percent_threshold=int(cfg.get("used_percent_threshold", 95)),
     )
+
+
+def _get_local_pool_maintainer(cfg: Optional[Dict[str, Any]] = None) -> LocalPoolMaintainer:
+    cfg = cfg or _get_sync_config()
+    return LocalPoolMaintainer(tokens_dir=TOKENS_DIR, proxy=str(cfg.get("proxy", "") or "").strip())
 
 
 def _get_sub2api_maintainer(cfg: Optional[Dict[str, Any]] = None) -> Optional[Sub2ApiMaintainer]:
@@ -1736,7 +1825,6 @@ class ProxyPoolConfigRequest(BaseModel):
 
 class ProxySaveRequest(BaseModel):
     proxy: str = ""
-    auto_register: bool = False
 
 
 class SyncConfigRequest(BaseModel):
@@ -1751,9 +1839,6 @@ class SyncConfigRequest(BaseModel):
     sub2api_auto_maintain: bool = False
     sub2api_maintain_interval_minutes: int = 30
     sub2api_maintain_actions: Dict[str, bool] = Field(default_factory=dict)
-    multithread: bool = False
-    thread_count: int = 3
-    auto_register: bool = False
 
 
 class SyncNowRequest(BaseModel):
@@ -1800,7 +1885,6 @@ async def api_stop() -> Dict[str, Any]:
 async def api_save_proxy(req: ProxySaveRequest) -> Dict[str, str]:
     cfg = _get_sync_config()
     cfg["proxy"] = req.proxy.strip()
-    cfg["auto_register"] = req.auto_register
     _save_sync_config(cfg)
     return {"status": "saved"}
 
@@ -1809,6 +1893,16 @@ class TaskControlRequest(BaseModel):
     multithread: Optional[bool] = None
     thread_count: Optional[int] = None
     auto_register: Optional[bool] = None
+
+
+@app.get("/api/task-control")
+async def api_get_task_control() -> Dict[str, Any]:
+    cfg = _get_sync_config()
+    return {
+        "multithread": bool(cfg.get("multithread", False)),
+        "thread_count": int(cfg.get("thread_count", 3) or 3),
+        "auto_register": bool(cfg.get("auto_register", False)),
+    }
 
 
 @app.post("/api/task-control")
@@ -1920,6 +2014,11 @@ async def api_get_sync_config() -> Dict[str, Any]:
     cfg.setdefault("sub2api_min_candidates", 200)
     cfg.setdefault("sub2api_auto_maintain", False)
     cfg.setdefault("sub2api_maintain_interval_minutes", 30)
+    cfg.setdefault("local_maintain_enabled", False)
+    cfg.setdefault("local_maintain_interval_minutes", 60)
+    cfg.setdefault("local_refresh_threshold_pct", 60)
+    cfg.setdefault("local_check_interval_hours", 6)
+    cfg.setdefault("local_maintain_thread_count", cfg.get("thread_count", 3))
     cfg.setdefault("upload_mode", "snapshot")
     cfg.setdefault("multithread", False)
     cfg.setdefault("thread_count", 3)
@@ -2117,9 +2216,6 @@ async def api_set_sync_config(req: SyncConfigRequest) -> Dict[str, Any]:
         "sub2api_auto_maintain": req.sub2api_auto_maintain,
         "sub2api_maintain_interval_minutes": max(5, req.sub2api_maintain_interval_minutes),
         "sub2api_maintain_actions": _normalize_sub2api_maintain_actions(req.sub2api_maintain_actions),
-        "multithread": req.multithread,
-        "thread_count": max(1, min(req.thread_count, 10)),
-        "auto_register": req.auto_register,
     })
     # 清理历史遗留字段
     cfg.pop("headful", None)
@@ -2932,6 +3028,14 @@ class PoolConfigRequest(BaseModel):
     maintain_interval_minutes: int = 30
 
 
+class LocalPoolConfigRequest(BaseModel):
+    local_maintain_enabled: bool = False
+    local_maintain_interval_minutes: int = 60
+    local_refresh_threshold_pct: float = 60
+    local_check_interval_hours: int = 6
+    local_maintain_thread_count: int = 3
+
+
 class MailConfigRequest(BaseModel):
     mail_provider: str = "mailtm"
     mail_config: Dict[str, str] = {}
@@ -3003,10 +3107,23 @@ async def api_pool_maintain() -> Dict[str, Any]:
         raise HTTPException(status_code=409, detail="维护任务已在执行中")
     try:
         result = await run_in_threadpool(pm.probe_and_clean_sync)
+        marked_local = 0
+        deleted_names = [name for name in (result.get("deleted_names") or []) if str(name).strip()]
+        for item in result.get("invalid") or []:
+            name = str(item.get("name") or "").strip()
+            if not name or name not in deleted_names:
+                continue
+            if _mark_local_token_status_by_email(
+                name,
+                status="cooling",
+                next_check_at=datetime.now(timezone.utc),
+                last_used_percent=item.get("used_percent"),
+            ):
+                marked_local += 1
         _state.broadcast({
             "ts": datetime.now().strftime("%H:%M:%S"),
             "level": "info",
-            "message": f"[POOL] 维护完成: 无效 {result.get('invalid_count', 0)}, 已删除 {result.get('deleted_ok', 0)}",
+            "message": f"[POOL] 维护完成: 无效 {result.get('invalid_count', 0)}, 已删除 {result.get('deleted_ok', 0)}" + (f", 本地已标记 {marked_local}" if marked_local else ""),
             "step": "pool_maintain",
         })
         return result
@@ -3026,6 +3143,59 @@ async def api_pool_auto(enable: bool = True) -> Dict[str, Any]:
     else:
         _stop_auto_maintain()
     return {"auto_maintain": enable}
+
+
+@app.get("/api/local-pool/status")
+async def api_local_pool_status() -> Dict[str, Any]:
+    cfg = _get_sync_config()
+    maintainer = _get_local_pool_maintainer(cfg)
+    status = await run_in_threadpool(maintainer.get_status)
+    status["enabled"] = bool(cfg.get("local_maintain_enabled", False))
+    return status
+
+
+@app.post("/api/local-pool/maintain")
+async def api_local_pool_maintain() -> Dict[str, Any]:
+    if not _pool_maintain_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="维护任务已在执行中")
+    try:
+        cfg = _get_sync_config()
+        maintainer = _get_local_pool_maintainer(cfg)
+        emitter = EventEmitter(q=getattr(_state, "_bridge_q", None), cli_mode=True)
+        result = await run_in_threadpool(maintainer.run_cycle, emitter, _get_pool_maintainer(cfg), cfg)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        _pool_maintain_lock.release()
+
+
+@app.get("/api/local-pool/config")
+async def api_get_local_pool_config() -> Dict[str, Any]:
+    cfg = _get_sync_config()
+    return {
+        "local_maintain_enabled": cfg.get("local_maintain_enabled", False),
+        "local_maintain_interval_minutes": cfg.get("local_maintain_interval_minutes", 60),
+        "local_refresh_threshold_pct": cfg.get("local_refresh_threshold_pct", 60),
+        "local_check_interval_hours": cfg.get("local_check_interval_hours", 6),
+        "local_maintain_thread_count": cfg.get("local_maintain_thread_count", cfg.get("thread_count", 3)),
+    }
+
+
+@app.post("/api/local-pool/config")
+async def api_local_pool_config(req: LocalPoolConfigRequest) -> Dict[str, Any]:
+    cfg = _get_sync_config()
+    cfg["local_maintain_enabled"] = req.local_maintain_enabled
+    cfg["local_maintain_interval_minutes"] = max(5, req.local_maintain_interval_minutes)
+    cfg["local_refresh_threshold_pct"] = max(1, min(float(req.local_refresh_threshold_pct), 100))
+    cfg["local_check_interval_hours"] = max(1, req.local_check_interval_hours)
+    cfg["local_maintain_thread_count"] = max(1, min(req.local_maintain_thread_count, 10))
+    _save_sync_config(cfg)
+    if req.local_maintain_enabled:
+        _start_local_maintain()
+    else:
+        _stop_local_maintain()
+    return {"status": "saved"}
 
 
 @app.get("/api/mail/config")
@@ -3114,19 +3284,11 @@ def _try_auto_register() -> None:
     if not cfg.get("auto_register"):
         _state.broadcast({
             "ts": ts, "level": "info",
-            "message": "[AUTO] 自动注册未开启，跳过（请勾选「池不足自动注册」并保存代理）",
+            "message": "[AUTO] 自动注册未开启，跳过（请勾选「池不足自动注册」）",
             "step": "auto_register",
         })
         return
     proxy = str(cfg.get("proxy", "") or "").strip()
-    proxy_pool_enabled = bool(cfg.get("proxy_pool_enabled", False))
-    if not proxy and not proxy_pool_enabled:
-        _state.broadcast({
-            "ts": ts, "level": "warn",
-            "message": "[AUTO] 跳过自动注册：未配置固定代理且代理池未启用，请先配置",
-            "step": "auto_register",
-        })
-        return
     if _state.status not in ("idle", "stopped", "finished", "failed"):
         _state.broadcast({
             "ts": ts, "level": "info",
@@ -3239,6 +3401,20 @@ def _start_auto_maintain() -> None:
                         "step": "pool_auto",
                     })
                     result = pm.probe_and_clean_sync()
+                    deleted_names = [name for name in (result.get("deleted_names") or []) if str(name).strip()]
+                    marked_local = 0
+                    for item in result.get("invalid") or []:
+                        name = str(item.get("name") or "").strip()
+                        if not name or name not in deleted_names:
+                            continue
+                        used_percent = item.get("used_percent")
+                        if _mark_local_token_status_by_email(
+                            name,
+                            status="cooling",
+                            next_check_at=datetime.now(timezone.utc),
+                            last_used_percent=used_percent,
+                        ):
+                            marked_local += 1
                     total = result.get('total', 0)
                     candidates = result.get('candidates', 0)
                     invalid_count = result.get('invalid_count', 0)
@@ -3260,6 +3436,7 @@ def _start_auto_maintain() -> None:
                             "message": (
                                 f"[POOL] 自动维护完成: 总 {candidates}/{pm.min_candidates}, 健康 {healthy}, "
                                 f"无效 {invalid_count}, 已删除 {deleted_ok}"
+                                + (f", 本地已标记 {marked_local}" if marked_local else "")
                                 + (f", 删除失败 {deleted_fail}" if deleted_fail else "")
                             ),
                             "step": "pool_auto",
@@ -3302,6 +3479,59 @@ def _stop_auto_maintain() -> None:
         if _auto_maintain_thread is thread and (thread is None or not thread.is_alive()):
             _auto_maintain_thread = None
             _auto_maintain_stop = None
+
+
+def _start_local_maintain() -> None:
+    global _local_maintain_thread, _local_maintain_stop
+    cfg = _get_sync_config()
+    interval = max(5, int(cfg.get("local_maintain_interval_minutes", 60))) * 60
+    with _local_maintain_ctl_lock:
+        if _local_maintain_thread and _local_maintain_thread.is_alive():
+            return
+        stop_event = threading.Event()
+        _local_maintain_stop = stop_event
+
+    def _loop(local_stop: threading.Event) -> None:
+        while not local_stop.is_set():
+            cfg_now = _get_sync_config()
+            maintainer = _get_local_pool_maintainer(cfg_now)
+            try:
+                emitter = EventEmitter(q=getattr(_state, "_bridge_q", None), cli_mode=True)
+                maintainer.run_cycle(emitter, _get_pool_maintainer(cfg_now), cfg_now)
+            except Exception as e:
+                _state.broadcast({
+                    "ts": datetime.now().strftime("%H:%M:%S"),
+                    "level": "error",
+                    "message": f"[LOCAL] 自动维护异常: {e}",
+                    "step": "local_pool",
+                })
+            _state.broadcast({
+                "ts": datetime.now().strftime("%H:%M:%S"),
+                "level": "info",
+                "message": f"[LOCAL] 下次维护: {interval // 60} 分钟后",
+                "step": "local_pool",
+            })
+            local_stop.wait(interval)
+
+    thread = threading.Thread(target=_loop, args=(stop_event,), daemon=True)
+    with _local_maintain_ctl_lock:
+        _local_maintain_thread = thread
+    thread.start()
+
+
+def _stop_local_maintain() -> None:
+    global _local_maintain_thread, _local_maintain_stop
+    with _local_maintain_ctl_lock:
+        stop_event = _local_maintain_stop
+        thread = _local_maintain_thread
+    if stop_event:
+        stop_event.set()
+    if thread and thread.is_alive():
+        thread.join(timeout=5)
+    with _local_maintain_ctl_lock:
+        if _local_maintain_thread is thread and (thread is None or not thread.is_alive()):
+            _local_maintain_thread = None
+            _local_maintain_stop = None
 
 
 # ==========================================
@@ -3625,6 +3855,8 @@ async def _startup_restore_background_tasks() -> None:
         _start_auto_maintain()
     if cfg.get("sub2api_auto_maintain"):
         _start_sub2api_auto_maintain()
+    if cfg.get("local_maintain_enabled"):
+        _start_local_maintain()
 
 
 @app.on_event("shutdown")
@@ -3632,6 +3864,7 @@ async def _shutdown_background_tasks() -> None:
     _service_shutdown_event.set()
     _stop_auto_maintain()
     _stop_sub2api_auto_maintain()
+    _stop_local_maintain()
 
 
 # 挂载静态文件

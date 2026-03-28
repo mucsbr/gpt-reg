@@ -507,6 +507,50 @@
         </div>
       </div>
 
+      <div class="config-card collapsible open">
+        <div class="collapsible-trigger">
+          <span>本地池维护</span>
+          <span class="collapse-icon">▶</span>
+        </div>
+        <div class="collapsible-body">
+          <div class="config-row">
+            <div class="config-field" style="flex:1;">
+              <label class="ios-toggle-label" for="localMaintainEnabled">
+                <span class="ios-toggle ios-toggle-sm">
+                  <input type="checkbox" id="localMaintainEnabled" />
+                  <span class="toggle-track"></span>
+                </span>
+                <span>启用本地池自动维护</span>
+              </label>
+            </div>
+            <div class="config-field" style="flex:1;">
+              <label>维护间隔(分钟)</label>
+              <input type="number" id="localMaintainInterval" value="60" min="5" />
+            </div>
+          </div>
+          <div class="config-row">
+            <div class="config-field" style="flex:1;">
+              <label>回推用量阈值(%)</label>
+              <input type="number" id="localRefreshThreshold" value="60" min="1" max="100" step="0.1" />
+            </div>
+            <div class="config-field" style="flex:1;">
+              <label>额度检查间隔(小时)</label>
+              <input type="number" id="localCheckIntervalHours" value="6" min="1" />
+            </div>
+            <div class="config-field" style="flex:1;">
+              <label>线程数</label>
+              <input type="number" id="localMaintainThreadCount" value="3" min="1" max="10" />
+            </div>
+          </div>
+          <div class="config-actions">
+            <button id="localMaintainBtn" class="btn btn-ghost btn-sm">手动维护</button>
+            <button id="localMaintainSaveBtn" class="btn btn-primary btn-sm">保存</button>
+            <span id="localMaintainStatus" class="inline-status"></span>
+          </div>
+          <div class="field-hint" id="localPoolStats">cooling -- / reauth -- / 总 --</div>
+        </div>
+      </div>
+
       <!-- Sub2Api 平台配置 -->
       <div class="config-card collapsible open">
         <div class="collapsible-trigger">

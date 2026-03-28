@@ -305,6 +305,8 @@ class PoolMaintainer:
             "invalid_count": len(invalid),
             "deleted_ok": deleted_ok,
             "deleted_fail": deleted_fail,
+            "deleted_names": names,
+            "invalid": invalid,
         }
 
     def probe_and_clean_sync(self, workers: int = 20, timeout: int = 10, retries: int = 1) -> Dict[str, Any]:

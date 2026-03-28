@@ -738,6 +738,10 @@ class MultiMailRouter:
         for name in providers_list:
             try:
                 p = create_provider_by_name(name, provider_configs.get(name, {}))
+                try:
+                    setattr(p, "provider_name", name)
+                except Exception:
+                    pass
                 self._provider_names.append(name)
                 self._providers[name] = p
                 self._failures[name] = 0

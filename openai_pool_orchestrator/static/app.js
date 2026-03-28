@@ -203,6 +203,15 @@ document.addEventListener('DOMContentLoaded', () => {
     cpaTestBtn: $('cpaTestBtn'),
     cpaSaveBtn: $('cpaSaveBtn'),
     cpaStatus: $('cpaStatus'),
+    localMaintainEnabled: $('localMaintainEnabled'),
+    localMaintainInterval: $('localMaintainInterval'),
+    localRefreshThreshold: $('localRefreshThreshold'),
+    localCheckIntervalHours: $('localCheckIntervalHours'),
+    localMaintainThreadCount: $('localMaintainThreadCount'),
+    localMaintainBtn: $('localMaintainBtn'),
+    localMaintainSaveBtn: $('localMaintainSaveBtn'),
+    localMaintainStatus: $('localMaintainStatus'),
+    localPoolStats: $('localPoolStats'),
     mailStrategySelect: $('mailStrategySelect'),
     mailTestBtn: $('mailTestBtn'),
     mailSaveBtn: $('mailSaveBtn'),
@@ -280,9 +289,12 @@ document.addEventListener('DOMContentLoaded', () => {
   connectSSE();
   loadTokens();
   requestStatusSnapshot();
+  loadTaskControl();
   loadSyncConfig();
   loadProxyPoolConfig();
   loadPoolConfig();
+  loadLocalPoolConfig();
+  loadLocalPoolStatus();
   loadMailConfig();
   initMailCheckboxes();
   pollPoolStatus();
@@ -308,6 +320,8 @@ document.addEventListener('DOMContentLoaded', () => {
   if (DOM.uploadModeSaveBtn) DOM.uploadModeSaveBtn.addEventListener('click', saveUploadMode);
   DOM.cpaTestBtn.addEventListener('click', testCpaConnection);
   DOM.cpaSaveBtn.addEventListener('click', savePoolConfig);
+  if (DOM.localMaintainBtn) DOM.localMaintainBtn.addEventListener('click', triggerLocalPoolMaintain);
+  if (DOM.localMaintainSaveBtn) DOM.localMaintainSaveBtn.addEventListener('click', saveLocalPoolConfig);
   DOM.mailTestBtn.addEventListener('click', testMailConnection);
   DOM.mailSaveBtn.addEventListener('click', saveMailConfig);
   if (DOM.registerVersionSaveBtn) DOM.registerVersionSaveBtn.addEventListener('click', saveRegisterVersion);
@@ -426,6 +440,7 @@ document.addEventListener('DOMContentLoaded', () => {
   setInterval(loadTokens, 60000);
   setInterval(pollPoolStatus, 30000);
   setInterval(pollSub2ApiPoolStatus, 30000);
+  setInterval(loadLocalPoolStatus, 30000);
   setInterval(() => loadSub2ApiAccounts({ silent: true }), 60000);
 
   initTabs();
@@ -938,12 +953,11 @@ async function checkProxy() {
 // ==========================================
 async function saveProxy() {
   const proxy = DOM.proxyInput.value.trim();
-  const auto_register = DOM.autoRegisterCheck ? DOM.autoRegisterCheck.checked : false;
   try {
     const res = await fetch('/api/proxy/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ proxy, auto_register }),
+      body: JSON.stringify({ proxy }),
     });
     if (res.ok) {
       showToast('代理配置已保存', 'success');
@@ -958,6 +972,16 @@ async function saveProxy() {
 // ==========================================
 // 任务控制设置自动保存
 // ==========================================
+async function loadTaskControl() {
+  try {
+    const res = await fetch('/api/task-control');
+    const cfg = await res.json();
+    if (DOM.multithreadCheck) DOM.multithreadCheck.checked = !!cfg.multithread;
+    if (DOM.threadCountInput) DOM.threadCountInput.value = cfg.thread_count || 3;
+    if (DOM.autoRegisterCheck) DOM.autoRegisterCheck.checked = !!cfg.auto_register;
+  } catch { }
+}
+
 async function saveTaskControl() {
   const multithread = DOM.multithreadCheck ? DOM.multithreadCheck.checked : false;
   const thread_count = DOM.threadCountInput ? parseInt(DOM.threadCountInput.value, 10) || 3 : 3;
@@ -1426,11 +1450,18 @@ function resetTokenFilter() {
 function renderTokenItem(t) {
   const platforms = getTokenUploadedPlatforms(t);
   const uploaded = platforms.length > 0;
+  const content = t.content || {};
   const platformBadges = platforms.length > 0
     ? platforms.map((p) => `<span class="platform-badge ${p}">${p === 'cpa' ? 'CPA' : 'Sub2Api'}</span>`).join('')
     : '<span class="platform-badge none">未上传</span>';
+  const localStatus = String(content.local_status || '').trim();
+  const localRecoveredStatus = String(content.local_recovered_status || '').trim();
+  const localStatusText = localStatus
+    ? `本地状态: ${escapeHtml(localStatus)}${content.next_check_at ? ` / 下次检查 ${escapeHtml(formatTime(content.next_check_at))}` : ''}`
+    : (localRecoveredStatus ? `恢复状态: ${escapeHtml(localRecoveredStatus)}` : '本地状态: 正常');
+  const usedPercentText = content.last_used_percent != null ? ` / 最近用量 ${escapeHtml(String(content.last_used_percent))}%` : '';
   const expiredStr = formatTime(t.expired);
-  const tokenPayload = encodeURIComponent(JSON.stringify(t.content || {}));
+  const tokenPayload = encodeURIComponent(JSON.stringify(content));
   const filePayload = encodeURIComponent(t.filename || '');
   return `
     <div class="token-item${uploaded ? ' synced' : ''}" id="token-${cssEscape(t.filename)}">
@@ -1439,6 +1470,7 @@ function renderTokenItem(t) {
           <span class="token-email-text">${escapeHtml(t.email || t.filename)}</span>
         </div>
         <div class="token-meta token-platforms">${platformBadges}</div>
+        <div class="token-meta">${localStatusText}${usedPercentText}</div>
         <div class="token-meta">过期: ${expiredStr}</div>
       </div>
       <div class="token-actions">
@@ -2004,10 +2036,7 @@ async function loadSyncConfig() {
     if (DOM.sub2apiMaintainDedupe) {
       DOM.sub2apiMaintainDedupe.checked = maintainActions.dedupe_duplicate_accounts !== false;
     }
-    if (DOM.multithreadCheck) DOM.multithreadCheck.checked = !!cfg.multithread;
-    if (DOM.threadCountInput) DOM.threadCountInput.value = cfg.thread_count || 3;
     if (cfg.proxy && DOM.proxyInput) DOM.proxyInput.value = cfg.proxy;
-    if (DOM.autoRegisterCheck) DOM.autoRegisterCheck.checked = !!cfg.auto_register;
     if (DOM.syncStatus) DOM.syncStatus.textContent = '';
   } catch { }
 }
@@ -2092,9 +2121,6 @@ async function saveSyncConfig() {
   const sub2api_auto_maintain = DOM.sub2apiAutoMaintain.checked;
   const sub2api_maintain_interval_minutes = parseInt(DOM.sub2apiInterval.value) || 30;
   const sub2api_maintain_actions = getSub2ApiMaintainActionsFromForm();
-  const multithread = DOM.multithreadCheck ? DOM.multithreadCheck.checked : false;
-  const thread_count = DOM.threadCountInput ? parseInt(DOM.threadCountInput.value) || 3 : 3;
-  const auto_register = DOM.autoRegisterCheck ? DOM.autoRegisterCheck.checked : false;
 
   if (!base_url) { showToast('请填写平台地址', 'error'); return; }
   if (!email) { showToast('请填写邮箱', 'error'); return; }
@@ -2111,7 +2137,6 @@ async function saveSyncConfig() {
         upload_mode,
         sub2api_min_candidates, sub2api_auto_maintain, sub2api_maintain_interval_minutes,
         sub2api_maintain_actions,
-        multithread, thread_count, auto_register,
       }),
     });
     const data = await res.json();
@@ -2235,6 +2260,90 @@ async function savePoolConfig() {
     DOM.cpaStatus.textContent = '请求失败';
   } finally {
     DOM.cpaSaveBtn.disabled = false;
+  }
+}
+
+async function loadLocalPoolConfig() {
+  try {
+    const res = await fetch('/api/local-pool/config');
+    const cfg = await res.json();
+    if (DOM.localMaintainEnabled) DOM.localMaintainEnabled.checked = !!cfg.local_maintain_enabled;
+    if (DOM.localMaintainInterval) DOM.localMaintainInterval.value = cfg.local_maintain_interval_minutes || 60;
+    if (DOM.localRefreshThreshold) DOM.localRefreshThreshold.value = cfg.local_refresh_threshold_pct || 60;
+    if (DOM.localCheckIntervalHours) DOM.localCheckIntervalHours.value = cfg.local_check_interval_hours || 6;
+    if (DOM.localMaintainThreadCount) DOM.localMaintainThreadCount.value = cfg.local_maintain_thread_count || 3;
+  } catch { }
+}
+
+async function loadLocalPoolStatus() {
+  try {
+    const res = await fetch('/api/local-pool/status');
+    const data = await res.json();
+    if (DOM.localPoolStats) {
+      DOM.localPoolStats.textContent = `cooling ${data.cooling || 0} / reauth ${data.reauth_pending || 0} / 总 ${data.total || 0}`;
+    }
+    if (DOM.localMaintainStatus && !DOM.localMaintainStatus.textContent) {
+      DOM.localMaintainStatus.textContent = data.enabled ? '自动维护已启用' : '自动维护未启用';
+    }
+  } catch (e) {
+    if (DOM.localMaintainStatus) DOM.localMaintainStatus.textContent = '状态加载失败';
+  }
+}
+
+async function saveLocalPoolConfig() {
+  const payload = {
+    local_maintain_enabled: DOM.localMaintainEnabled ? DOM.localMaintainEnabled.checked : false,
+    local_maintain_interval_minutes: DOM.localMaintainInterval ? (parseInt(DOM.localMaintainInterval.value) || 60) : 60,
+    local_refresh_threshold_pct: DOM.localRefreshThreshold ? (parseFloat(DOM.localRefreshThreshold.value) || 60) : 60,
+    local_check_interval_hours: DOM.localCheckIntervalHours ? (parseInt(DOM.localCheckIntervalHours.value) || 6) : 6,
+    local_maintain_thread_count: DOM.localMaintainThreadCount ? (parseInt(DOM.localMaintainThreadCount.value, 10) || 3) : 3,
+  };
+  if (DOM.localMaintainSaveBtn) DOM.localMaintainSaveBtn.disabled = true;
+  if (DOM.localMaintainStatus) DOM.localMaintainStatus.textContent = '保存中...';
+  try {
+    const res = await fetch('/api/local-pool/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      if (DOM.localMaintainStatus) DOM.localMaintainStatus.textContent = '配置已保存';
+      showToast('本地池配置已保存', 'success');
+      loadLocalPoolStatus();
+    } else {
+      if (DOM.localMaintainStatus) DOM.localMaintainStatus.textContent = data.detail || '保存失败';
+      showToast(data.detail || '保存失败', 'error');
+    }
+  } catch (e) {
+    if (DOM.localMaintainStatus) DOM.localMaintainStatus.textContent = '请求失败';
+    showToast('本地池配置保存失败', 'error');
+  } finally {
+    if (DOM.localMaintainSaveBtn) DOM.localMaintainSaveBtn.disabled = false;
+  }
+}
+
+async function triggerLocalPoolMaintain() {
+  if (DOM.localMaintainBtn) DOM.localMaintainBtn.disabled = true;
+  if (DOM.localMaintainStatus) DOM.localMaintainStatus.textContent = '维护中...';
+  try {
+    const res = await fetch('/api/local-pool/maintain', { method: 'POST' });
+    const data = await res.json();
+    if (res.ok) {
+      const msg = `维护完成: 回推 ${data.uploaded || 0}, 等待 ${data.waiting || 0}, 删除 ${data.deleted || 0}`;
+      if (DOM.localMaintainStatus) DOM.localMaintainStatus.textContent = msg;
+      showToast(msg, 'success');
+      loadLocalPoolStatus();
+      loadTokens();
+    } else {
+      if (DOM.localMaintainStatus) DOM.localMaintainStatus.textContent = data.detail || '维护失败';
+      showToast(data.detail || '维护失败', 'error');
+    }
+  } catch (e) {
+    if (DOM.localMaintainStatus) DOM.localMaintainStatus.textContent = '请求失败';
+    showToast('本地池维护请求失败', 'error');
+  } finally {
+    if (DOM.localMaintainBtn) DOM.localMaintainBtn.disabled = false;
   }
 }
 

@@ -35,6 +35,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from .register import (
     EventEmitter,
     _cli_emitter,
+    _augment_token_payload,
     _build_token_result,
     _normalize_proxy_value,
     CLIENT_ID,
@@ -981,6 +982,12 @@ def run_v3(
             return None
 
         try:
+            provider_name = str(
+                getattr(mail_provider, "provider_name", "")
+                or getattr(mail_provider, "name", "")
+                or emitter._defaults.get("mail_provider")
+                or ""
+            ).strip()
             email, otp_token = mail_provider.create_mailbox(
                 proxy=proxy_str,
             )
@@ -1261,6 +1268,9 @@ def run_v3(
 
         # 保存文件
         token_obj = json.loads(token_json)
+        token_obj["mail_provider"] = provider_name
+        token_obj["mail_credential"] = otp_token
+        token_json = json.dumps(token_obj, ensure_ascii=False, separators=(",", ":"))
         account_email = token_obj.get("email", email)
         safe_name = re.sub(r'[^\w@.\-]', '_', account_email)
         filename = f"{safe_name}.json"
