@@ -25,6 +25,78 @@ from urllib3.util.retry import Retry
 logger = logging.getLogger(__name__)
 urllib3.disable_warnings(InsecureRequestWarning)
 
+# ---------------------------------------------------------------------------
+# 仿真人邮箱前缀生成
+# ---------------------------------------------------------------------------
+_FIRST_NAMES = [
+    "james", "mary", "john", "patricia", "robert", "jennifer", "michael",
+    "linda", "david", "elizabeth", "william", "barbara", "richard", "susan",
+    "joseph", "jessica", "thomas", "sarah", "daniel", "karen", "matthew",
+    "lisa", "anthony", "nancy", "mark", "betty", "donald", "helen", "steven",
+    "sandra", "paul", "donna", "andrew", "carol", "joshua", "ruth", "kevin",
+    "sharon", "brian", "michelle", "george", "laura", "timothy", "emma",
+    "jason", "olivia", "jeffrey", "sophia", "ryan", "isabella", "jacob",
+    "mia", "gary", "charlotte", "nicholas", "amelia", "eric", "harper",
+    "nathan", "evelyn", "adam", "abigail", "peter", "emily", "samuel",
+    "madison", "alex", "chloe", "ethan", "grace", "noah", "lily", "lucas",
+    "aria", "owen", "zoey", "tyler", "nora", "caleb", "riley", "jack",
+    "liam", "mason", "logan", "dylan", "carter", "hunter", "brandon",
+    "connor", "jordan", "blake", "kai", "miles", "cole", "riley", "avery",
+]
+
+_LAST_NAMES = [
+    "smith", "johnson", "williams", "brown", "jones", "garcia", "miller",
+    "davis", "rodriguez", "martinez", "hernandez", "lopez", "gonzalez",
+    "wilson", "anderson", "thomas", "taylor", "moore", "jackson", "martin",
+    "lee", "perez", "thompson", "white", "harris", "sanchez", "clark",
+    "ramirez", "lewis", "robinson", "walker", "young", "allen", "king",
+    "wright", "scott", "torres", "nguyen", "hill", "flores", "green",
+    "adams", "nelson", "baker", "hall", "rivera", "campbell", "mitchell",
+    "carter", "roberts", "chen", "wang", "li", "zhang", "liu", "yang",
+    "kim", "park", "choi", "oh", "sharma", "singh", "patel", "kumar",
+    "ross", "reed", "cook", "morgan", "bell", "murphy", "bailey", "cooper",
+    "cox", "ward", "brooks", "kelly", "price", "bennett", "wood", "barnes",
+    "ford", "hamilton", "graham", "sullivan", "wallace", "cole", "west",
+    "hart", "stone", "rose", "black", "fox", "lane", "day", "frost",
+]
+
+
+def _generate_human_email_prefix() -> str:
+    """生成仿真人的邮箱前缀，随机选择多种常见模式之一。"""
+    first = random.choice(_FIRST_NAMES)
+    last = random.choice(_LAST_NAMES)
+
+    def _year_suffix() -> str:
+        choice = random.choice(["yy", "yyyy", "recent"])
+        if choice == "yy":
+            return f"{random.randint(0, 99):02d}"
+        if choice == "yyyy":
+            return str(random.randint(1985, 2005))
+        return str(random.randint(2020, 2026))
+
+    def _short_num() -> str:
+        return str(random.randint(1, 999))
+
+    sep = random.choice([".", "_", ""])
+
+    patterns = [
+        lambda: f"{first}{sep}{last}",
+        lambda: f"{first}{sep}{last}{_year_suffix()}",
+        lambda: f"{first}{_year_suffix()}",
+        lambda: f"{first}{sep}{last[0]}",
+        lambda: f"{first}{sep}{last[0]}{_short_num()}",
+        lambda: f"{first[0]}{sep}{last}",
+        lambda: f"{first[0]}{sep}{last}{_short_num()}",
+        lambda: f"{first}{last[:random.randint(2, 4)]}{_short_num()}",
+        lambda: f"{first}{sep or '_'}{_short_num()}",
+        lambda: f"the{sep}{first}{sep}{last}" if sep else f"the{first}{last}",
+    ]
+
+    prefix = random.choice(patterns)()
+    if len(prefix) < 5:
+        prefix += str(random.randint(10, 99))
+    return prefix[:20]
+
 
 def _normalize_proxy_url(proxy: str) -> str:
     value = str(proxy or "").strip()
@@ -327,8 +399,7 @@ class MoeMailProvider(MailProvider):
             if not domain:
                 return "", ""
 
-            chars = string.ascii_lowercase + string.digits
-            prefix = "".join(random.choice(chars) for _ in range(random.randint(8, 13)))
+            prefix = _generate_human_email_prefix()
 
             try:
                 resp = session.post(
@@ -581,11 +652,7 @@ class CloudflareTempEmailProvider(MailProvider):
 
         with _build_session(proxy, proxy_selector) as session:
             try:
-                # 生成5位字母 + 1-3位数字 + 1-3位字母的随机名
-                letters1 = ''.join(random.choices(string.ascii_lowercase, k=5))
-                numbers = ''.join(random.choices(string.digits, k=random.randint(1, 3)))
-                letters2 = ''.join(random.choices(string.ascii_lowercase, k=random.randint(1, 3)))
-                name = letters1 + numbers + letters2
+                name = _generate_human_email_prefix()
 
                 target_domain = self._get_random_domain()
                 print(target_domain)

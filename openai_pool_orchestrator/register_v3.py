@@ -373,6 +373,11 @@ def _fetch_sentinel_challenge(session: requests.Session, device_id: str, flow: s
             ts = data["turnstile"]
             ts_info = {k: (type(v).__name__, len(str(v)) if isinstance(v, (str, list, dict)) else v) for k, v in ts.items()}
             print(f"[DEBUG sentinel/req] flow={flow} turnstile keys: {ts_info}")
+        # DEBUG: so 内部结构
+        if "so" in data and isinstance(data["so"], dict):
+            so = data["so"]
+            so_info = {k: (type(v).__name__, len(str(v)) if isinstance(v, (str, list, dict)) else v) for k, v in so.items()}
+            print(f"[DEBUG sentinel/req] flow={flow} so keys: {so_info}")
         return data
     except Exception:
         return None
