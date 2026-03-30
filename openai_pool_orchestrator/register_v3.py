@@ -364,7 +364,16 @@ def _fetch_sentinel_challenge(session: requests.Session, device_id: str, flow: s
         )
         if resp.status_code != 200:
             return None
-        return resp.json()
+        data = resp.json()
+        # DEBUG: 打印 sentinel/req 响应的所有顶层字段
+        keys_info = {k: (type(v).__name__, len(str(v)) if isinstance(v, (str, list, dict)) else v) for k, v in data.items()}
+        print(f"[DEBUG sentinel/req] flow={flow} response keys: {keys_info}")
+        # DEBUG: turnstile 内部结构
+        if "turnstile" in data and isinstance(data["turnstile"], dict):
+            ts = data["turnstile"]
+            ts_info = {k: (type(v).__name__, len(str(v)) if isinstance(v, (str, list, dict)) else v) for k, v in ts.items()}
+            print(f"[DEBUG sentinel/req] flow={flow} turnstile keys: {ts_info}")
+        return data
     except Exception:
         return None
 
@@ -430,8 +439,18 @@ def _build_api_headers(device_id: str, referer: str, with_sentinel: bool = False
 
 
 def _complete_about_you(session: requests.Session, device_id: str, name: str, birthday: str,
-                        emitter: EventEmitter) -> bool:
-    """完成 about-you 资料提交（双候选策略）"""
+                        emitter: EventEmitter) -> Optional[str]:
+    """完成 about-you 资料提交（双候选策略），成功返回 continue_url，失败返回 None"""
+
+    # 先 GET /about-you 页面，建立正确的 session/cookie 状态
+    try:
+        h_nav = dict(NAVIGATE_HEADERS)
+        h_nav["referer"] = f"{AUTH_BASE}/email-verification"
+        session.get(f"{AUTH_BASE}/about-you", headers=h_nav,
+                    verify=False, timeout=30, allow_redirects=True)
+    except Exception as e:
+        emitter.warn(f"GET /about-you 失败（继续尝试）: {e}", step="create_account")
+
     create_so_token = _fetch_sentinel_so_token(session, device_id, flow="oauth_create_account")
     create_sentinel = _build_sentinel_token(session, device_id, flow="oauth_create_account")
 
@@ -466,7 +485,29 @@ def _complete_about_you(session: requests.Session, device_id: str, name: str, bi
             continue
 
         if 200 <= resp.status_code < 300:
-            return True
+            try:
+                resp_data = resp.json()
+                return resp_data.get("continue_url", "")
+            except Exception:
+                return ""
+
+        # registration_disallowed 时重新获取 sentinel 重试
+        if resp.status_code == 400 and "registration_disallowed" in (resp.text or ""):
+            emitter.info(f"{label}: registration_disallowed，重新获取 sentinel 重试...", step="create_account")
+            fresh_sentinel = _build_sentinel_token(session, device_id, flow="oauth_create_account")
+            if fresh_sentinel:
+                headers["openai-sentinel-token"] = fresh_sentinel
+                try:
+                    resp2 = session.post(url, headers=headers, data=json.dumps(data, separators=(",", ":")),
+                                         verify=False, timeout=30)
+                    if 200 <= resp2.status_code < 300:
+                        try:
+                            resp_data = resp2.json()
+                            return resp_data.get("continue_url", "")
+                        except Exception:
+                            return ""
+                except Exception:
+                    pass
 
         err_code = _extract_openai_error_code(resp)
         error_line = f"{label}: HTTP {resp.status_code} {_response_preview(resp)}"
@@ -476,7 +517,7 @@ def _complete_about_you(session: requests.Session, device_id: str, name: str, bi
 
     if errors:
         emitter.error(f"账户信息填写失败: {errors[0]}", step="create_account")
-    return False
+    return None
 
 
 # =================== consent 流程辅助函数 ===================
@@ -534,7 +575,184 @@ def _follow_and_extract_code(session_obj: requests.Session, url: str, max_depth:
     return None
 
 
-# =================== 登录换 Token ===================
+# =================== Session Fast Path（从 create_account 的 continue_url 直接拿 token） ===================
+
+
+def _jwt_claims_no_verify(token: str) -> dict:
+    """解析 JWT payload，不验签"""
+    if not token:
+        return {}
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {}
+        payload = parts[1]
+        padding = 4 - len(payload) % 4
+        if padding != 4:
+            payload += "=" * padding
+        decoded = base64.urlsafe_b64decode(payload)
+        return json.loads(decoded)
+    except Exception:
+        return {}
+
+
+def _build_compat_id_token(email: str, account_id: str, user_id: str = "",
+                            plan_type: str = "free", exp: int = 0) -> str:
+    """构造最小兼容 id_token JWT（无签名，仅供 CPA 解析字段用）"""
+    header = {"alg": "none", "typ": "JWT"}
+    now = int(time.time())
+    payload = {
+        "email": email,
+        "iat": now,
+        "exp": exp or (now + 3600),
+        "sub": user_id or "",
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+            "chatgpt_user_id": user_id or account_id,
+            "plan_type": plan_type,
+        },
+    }
+    h = base64.urlsafe_b64encode(json.dumps(header, separators=(",", ":")).encode()).rstrip(b"=").decode()
+    p = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).rstrip(b"=").decode()
+    return f"{h}.{p}."
+
+
+def _session_fast_path(session: requests.Session, continue_url: str,
+                        email: str, password: str, proxy_str: str,
+                        emitter: EventEmitter) -> Optional[str]:
+    """
+    Session fast path: 用 create_account 返回的 continue_url 直接获取 token，
+    避免二次登录触发额外 OTP。
+
+    返回: token_json 字符串，失败返回 None
+    """
+    if not continue_url:
+        return None
+
+    # continue_url 可能是相对路径
+    if continue_url.startswith("/"):
+        callback_url = f"https://chatgpt.com{continue_url}"
+    else:
+        callback_url = continue_url
+
+    # 必须是 chatgpt.com 的 callback URL 且带 code 参数
+    if "chatgpt.com" not in callback_url or "code=" not in callback_url:
+        emitter.info(f"continue_url 不是 chatgpt callback: {callback_url[:120]}", step="get_token")
+        return None
+
+    emitter.info("使用 session fast path 获取 Token...", step="get_token")
+
+    # 新建 session 访问 chatgpt.com callback
+    chatgpt_session = _create_session(proxy_str)
+
+    # 步骤1: GET callback URL，让 ChatGPT 完成 code exchange 建立 session
+    try:
+        resp = chatgpt_session.get(
+            callback_url,
+            headers={
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "user-agent": USER_AGENT,
+                "upgrade-insecure-requests": "1",
+            },
+            allow_redirects=True,
+            verify=False,
+            timeout=30,
+        )
+        emitter.info(f"callback -> HTTP {resp.status_code} final={resp.url[:100]}", step="get_token")
+    except Exception as e:
+        emitter.warn(f"callback 请求失败: {e}", step="get_token")
+        return None
+
+    # 步骤2: GET /api/auth/session 拿 accessToken
+    try:
+        resp = chatgpt_session.get(
+            "https://chatgpt.com/api/auth/session",
+            headers={
+                "accept": "application/json",
+                "user-agent": USER_AGENT,
+                "referer": "https://chatgpt.com/",
+            },
+            verify=False,
+            timeout=30,
+        )
+    except Exception as e:
+        emitter.warn(f"session 请求失败: {e}", step="get_token")
+        return None
+
+    if resp.status_code != 200:
+        emitter.warn(f"session 响应: HTTP {resp.status_code}", step="get_token")
+        return None
+
+    try:
+        session_data = resp.json()
+    except Exception:
+        emitter.warn("session 响应解析失败", step="get_token")
+        return None
+
+    access_token = session_data.get("accessToken") or session_data.get("access_token") or ""
+    if not access_token:
+        emitter.warn("session 中未找到 accessToken", step="get_token")
+        return None
+
+    # 解析 JWT
+    claims = _jwt_claims_no_verify(access_token)
+    token_email = claims.get("email") or email
+    auth_claims = claims.get("https://api.openai.com/auth") or {}
+    account_id = auth_claims.get("chatgpt_account_id") or ""
+    user_id = auth_claims.get("chatgpt_user_id") or ""
+    plan_type = auth_claims.get("plan_type") or "free"
+    exp = claims.get("exp") or 0
+
+    if not account_id:
+        emitter.warn("accessToken 中无 chatgpt_account_id", step="get_token")
+        return None
+
+    # 构造兼容 id_token
+    compat_id_token = _build_compat_id_token(
+        email=token_email, account_id=account_id,
+        user_id=user_id, plan_type=plan_type, exp=exp,
+    )
+
+    refresh_token = session_data.get("refreshToken") or session_data.get("refresh_token") or ""
+    session_token = session_data.get("sessionToken") or session_data.get("session_token") or ""
+
+    now = int(time.time())
+    now_rfc3339 = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    exp_rfc3339 = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(exp)) if exp else now_rfc3339
+
+    token_obj = {
+        "type": "codex",
+        "email": token_email,
+        "id_token": compat_id_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "session_token": session_token,
+        "account_id": account_id,
+        "chatgpt_account_id": account_id,
+        "chatgpt_user_id": user_id,
+        "last_refresh": now_rfc3339,
+        "expires_at": exp_rfc3339,
+        "expired": exp_rfc3339,
+        "credentials": {
+            "id_token": compat_id_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "session_token": session_token,
+            "chatgpt_account_id": account_id,
+            "chatgpt_user_id": user_id,
+        },
+    }
+    if password:
+        token_obj["account_password"] = password
+
+    at_len = len(access_token)
+    has_rt = bool(refresh_token)
+    emitter.success(f"session fast path 成功 (AT长度: {at_len}, RT: {has_rt}, account: {account_id[:8]}...)", step="get_token")
+
+    return json.dumps(token_obj, ensure_ascii=False, separators=(",", ":"))
+
+
+# =================== 登录换 Token（备用，当 fast path 不可用时） ===================
 
 
 def _perform_login(session: requests.Session, email: str, password: str,
@@ -675,58 +893,94 @@ def _perform_login(session: requests.Session, email: str, password: str,
             emitter.error("[登录] 无 mail_provider/otp_token，无法接收验证码", step="login_otp")
             return None
 
-        # 循环拿验证码并尝试，跳过注册阶段已用过的旧验证码
         tried_codes = set(used_otp_codes or [])
         otp_ok = False
-        otp_deadline = time.time() + 120
 
         h_val = dict(COMMON_HEADERS)
         h_val["referer"] = f"{AUTH_BASE}/email-verification"
         h_val["oai-device-id"] = login_device_id
         h_val.update(_generate_datadog_trace())
 
-        while time.time() < otp_deadline and not otp_ok:
+        # 分段等待 + resend 重试（与注册步骤5一致：初始120s, resend后45/90/120s）
+        login_wait_rounds = [120, 45, 90, 120]
+
+        for attempt, wait_sec in enumerate(login_wait_rounds):
             if stop_event and stop_event.is_set():
                 return None
 
-            try:
-                otp_code = mail_provider.wait_for_otp(
-                    otp_token, email, proxy=proxy_str, stop_event=stop_event,
-                )
-            except TypeError:
-                otp_code = mail_provider.wait_for_otp(
-                    otp_token, email, proxy=proxy_str,
-                )
-
-            if not otp_code or otp_code in tried_codes:
-                time.sleep(2)
-                continue
-
-            tried_codes.add(otp_code)
-            emitter.info(f"[登录] 尝试验证码: {otp_code}", step="login_otp")
-
-            resp = login_session.post(
-                f"{AUTH_BASE}/api/accounts/email-otp/validate",
-                json={"code": otp_code},
-                headers=h_val, verify=False, timeout=30,
-            )
-
-            if resp.status_code == 200:
-                otp_ok = True
-                emitter.success(f"[登录] OTP 验证成功: {otp_code}", step="login_otp")
+            # 后续轮次先 resend
+            if attempt > 0:
+                emitter.info(f"[登录] 未收到验证码，第 {attempt} 次 resend...", step="login_otp")
+                h_resend = dict(COMMON_HEADERS)
+                h_resend["referer"] = f"{AUTH_BASE}/email-verification"
+                h_resend["oai-device-id"] = login_device_id
+                h_resend.update(_generate_datadog_trace())
+                sentinel_resend = _build_sentinel_token(login_session, login_device_id, flow="authorize_continue")
+                if sentinel_resend:
+                    h_resend["openai-sentinel-token"] = sentinel_resend
                 try:
-                    data = resp.json()
-                    continue_url = data.get("continue_url", "")
-                    page_type = data.get("page", {}).get("type", "")
-                except Exception:
-                    pass
+                    resp_resend = login_session.post(
+                        f"{AUTH_BASE}/api/accounts/email-otp/resend",
+                        headers=h_resend, json={},
+                        verify=False, timeout=30,
+                    )
+                    emitter.info(f"[登录] resend 响应: HTTP {resp_resend.status_code}", step="login_otp")
+                except Exception as e:
+                    emitter.warn(f"[登录] resend 请求失败: {e}", step="login_otp")
+
+            # 在本轮 wait_sec 内轮询验证码
+            round_deadline = time.time() + wait_sec
+            while time.time() < round_deadline and not otp_ok:
+                if stop_event and stop_event.is_set():
+                    return None
+
+                try:
+                    otp_code = mail_provider.wait_for_otp(
+                        otp_token, email, proxy=proxy_str, stop_event=stop_event,
+                        timeout=min(10, max(1, int(round_deadline - time.time()))),
+                    )
+                except TypeError:
+                    otp_code = mail_provider.wait_for_otp(
+                        otp_token, email, proxy=proxy_str,
+                        timeout=min(10, max(1, int(round_deadline - time.time()))),
+                    )
+
+                if not otp_code or otp_code in tried_codes:
+                    time.sleep(2)
+                    continue
+
+                tried_codes.add(otp_code)
+                emitter.info(f"[登录] 尝试验证码: {otp_code}", step="login_otp")
+
+                try:
+                    resp = login_session.post(
+                        f"{AUTH_BASE}/api/accounts/email-otp/validate",
+                        json={"code": otp_code},
+                        headers=h_val, verify=False, timeout=30,
+                    )
+                except Exception as e:
+                    emitter.warn(f"[登录] validate 请求失败: {e}", step="login_otp")
+                    continue
+
+                if resp.status_code == 200:
+                    otp_ok = True
+                    emitter.success(f"[登录] OTP 验证成功: {otp_code}", step="login_otp")
+                    try:
+                        data = resp.json()
+                        continue_url = data.get("continue_url", "")
+                        page_type = data.get("page", {}).get("type", "")
+                    except Exception:
+                        pass
+                    break
+                else:
+                    emitter.info(f"[登录] 验证码 {otp_code} 失败: {resp.status_code} {_response_preview(resp)}", step="login_otp")
+                    time.sleep(2)
+
+            if otp_ok:
                 break
-            else:
-                emitter.info(f"[登录] 验证码 {otp_code} 失败: {resp.status_code} {_response_preview(resp)}", step="login_otp")
-                time.sleep(2)
 
         if not otp_ok:
-            emitter.error("[登录] OTP 验证超时，所有验证码均失败", step="login_otp")
+            emitter.error("[登录] OTP 验证超时（已重试 resend）", step="login_otp")
             return None
 
         # 如果进入 about-you
@@ -1129,10 +1383,10 @@ def run_v3(
 
         time.sleep(1)
 
-        # 步骤5: 触发 OTP 发送
+        # 步骤5: 触发 OTP 发送 + resend 重试
         emitter.info("触发验证码发送...", step="send_otp")
 
-        # 5a: GET send 端点
+        # 5a: GET send 端点（初始触发）
         h_send = dict(NAVIGATE_HEADERS)
         h_send["referer"] = f"{AUTH_BASE}/create-account/password"
         session.get(f"{AUTH_BASE}/api/accounts/email-otp/send", headers=h_send,
@@ -1146,19 +1400,51 @@ def run_v3(
 
         emitter.success("验证码发送触发完成", step="send_otp")
 
-        # 等待 OTP
+        # 等待 OTP（初始等待 120s + resend 重试 45/90/120s）
         emitter.info("等待验证码...", step="wait_otp")
-        try:
-            otp_code = mail_provider.wait_for_otp(
-                otp_token, email, proxy=proxy_str, stop_event=stop_event,
-            )
-        except TypeError:
-            otp_code = mail_provider.wait_for_otp(
-                otp_token, email, proxy=proxy_str,
-            )
+        otp_code = ""
+        wait_rounds = [120, 45, 90, 120]  # 初始120s, resend后45s, 再resend后90s, 最后120s
+
+        for attempt, wait_sec in enumerate(wait_rounds):
+            if _stopped():
+                return None
+
+            # 第1轮是初始等待，后续轮次先 resend 再等待
+            if attempt > 0:
+                emitter.info(f"未收到验证码，第 {attempt} 次 resend...", step="send_otp")
+                h_resend = dict(COMMON_HEADERS)
+                h_resend["referer"] = f"{AUTH_BASE}/email-verification"
+                h_resend["oai-device-id"] = device_id
+                h_resend.update(_generate_datadog_trace())
+                sentinel_resend = _build_sentinel_token(session, device_id, flow="authorize_continue")
+                if sentinel_resend:
+                    h_resend["openai-sentinel-token"] = sentinel_resend
+                try:
+                    resp_resend = session.post(
+                        f"{AUTH_BASE}/api/accounts/email-otp/resend",
+                        headers=h_resend, json={},
+                        verify=False, timeout=30,
+                    )
+                    emitter.info(f"resend 响应: HTTP {resp_resend.status_code}", step="send_otp")
+                except Exception as e:
+                    emitter.warn(f"resend 请求失败: {e}", step="send_otp")
+
+            try:
+                otp_code = mail_provider.wait_for_otp(
+                    otp_token, email, proxy=proxy_str, stop_event=stop_event,
+                    timeout=wait_sec,
+                )
+            except TypeError:
+                otp_code = mail_provider.wait_for_otp(
+                    otp_token, email, proxy=proxy_str,
+                    timeout=wait_sec,
+                )
+
+            if otp_code:
+                break
 
         if not otp_code:
-            emitter.error("未收到验证码", step="wait_otp")
+            emitter.error("未收到验证码（已重试 resend）", step="wait_otp")
             return None
 
         emitter.success(f"验证码: {otp_code}", step="wait_otp")
@@ -1226,47 +1512,64 @@ def run_v3(
         name = f"{first_name} {last_name}"
         birthdate = _generate_random_birthday()
 
-        if not _complete_about_you(session, device_id, name, birthdate, emitter):
+        continue_url = _complete_about_you(session, device_id, name, birthdate, emitter)
+        if continue_url is None:
             return None
 
-        emitter.success("账号创建完成", step="create_account")
+        emitter.success(f"账号创建完成 (continue_url: {continue_url[:80] if continue_url else 'empty'})", step="create_account")
 
         if _stopped():
             return None
 
-        # ========== 第二阶段：登录换 Token ==========
+        # ========== 第二阶段：获取 Token ==========
 
-        time.sleep(random.uniform(2.0, 4.0))
+        time.sleep(random.uniform(1.0, 2.0))
 
-        emitter.info("开始登录换 Token...", step="get_token")
+        # 优先走 session fast path（从 create_account 的 continue_url 直接拿 token）
+        token_json = None
+        if continue_url:
+            token_json = _session_fast_path(
+                session=session,
+                continue_url=continue_url,
+                email=email,
+                password=password,
+                proxy_str=proxy_str,
+                emitter=emitter,
+            )
 
-        token_data = _perform_login(
-            session=session,
-            email=email,
-            password=password,
-            device_id=device_id,
-            code_verifier=code_verifier,
-            emitter=emitter,
-            mail_provider=mail_provider,
-            otp_token=otp_token,
-            proxy_str=proxy_str,
-            stop_event=stop_event,
-            used_otp_codes={otp_code},
-        )
+        # fast path 失败，fallback 到旧的登录换 Token 流程
+        if not token_json:
+            emitter.info("fast path 不可用，fallback 到登录换 Token...", step="get_token")
 
-        if not token_data:
-            emitter.error("登录换 Token 失败", step="get_token")
-            return None
+            time.sleep(random.uniform(1.0, 3.0))
 
-        # 构建标准 token JSON 并保存
-        emitter.info("保存 Token...", step="save_token")
-        try:
-            token_json = _build_token_result(token_data, account_password=password)
-        except Exception as e:
-            emitter.error(f"Token 构建失败: {e}", step="save_token")
-            return None
+            token_data = _perform_login(
+                session=session,
+                email=email,
+                password=password,
+                device_id=device_id,
+                code_verifier=code_verifier,
+                emitter=emitter,
+                mail_provider=mail_provider,
+                otp_token=otp_token,
+                proxy_str=proxy_str,
+                stop_event=stop_event,
+                used_otp_codes={otp_code},
+            )
+
+            if not token_data:
+                emitter.error("登录换 Token 失败", step="get_token")
+                return None
+
+            emitter.info("保存 Token...", step="save_token")
+            try:
+                token_json = _build_token_result(token_data, account_password=password)
+            except Exception as e:
+                emitter.error(f"Token 构建失败: {e}", step="save_token")
+                return None
 
         # 保存文件
+        emitter.info("保存 Token...", step="save_token")
         token_obj = json.loads(token_json)
         token_obj["mail_provider"] = provider_name
         token_obj["mail_credential"] = otp_token
