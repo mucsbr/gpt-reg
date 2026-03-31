@@ -535,6 +535,35 @@ def _mark_local_token_status_by_email(
     return _update_token_file(file_path, _apply)
 
 
+def _mark_deleted_cpa_accounts_cooling(result: Dict[str, Any]) -> int:
+    deleted_source = result.get("deleted_ok_names") if "deleted_ok_names" in result else result.get("deleted_names")
+    deleted_ok_names = {
+        str(name).strip()
+        for name in (deleted_source or [])
+        if str(name).strip()
+    }
+    if not deleted_ok_names:
+        return 0
+
+    marked_local = 0
+    for item in result.get("invalid") or []:
+        name = str(item.get("name") or "").strip()
+        if not name or name not in deleted_ok_names:
+            continue
+        email = str(item.get("email") or "").strip()
+        target_email = email or name
+        if not target_email:
+            continue
+        if _mark_local_token_status_by_email(
+            target_email,
+            status="cooling",
+            next_check_at=datetime.now(timezone.utc),
+            last_used_percent=item.get("used_percent"),
+        ):
+            marked_local += 1
+    return marked_local
+
+
 # ==========================================
 # 统计数据持久化
 # ==========================================
@@ -3107,19 +3136,7 @@ async def api_pool_maintain() -> Dict[str, Any]:
         raise HTTPException(status_code=409, detail="维护任务已在执行中")
     try:
         result = await run_in_threadpool(pm.probe_and_clean_sync)
-        marked_local = 0
-        deleted_names = [name for name in (result.get("deleted_names") or []) if str(name).strip()]
-        for item in result.get("invalid") or []:
-            name = str(item.get("name") or "").strip()
-            if not name or name not in deleted_names:
-                continue
-            if _mark_local_token_status_by_email(
-                name,
-                status="cooling",
-                next_check_at=datetime.now(timezone.utc),
-                last_used_percent=item.get("used_percent"),
-            ):
-                marked_local += 1
+        marked_local = _mark_deleted_cpa_accounts_cooling(result)
         _state.broadcast({
             "ts": datetime.now().strftime("%H:%M:%S"),
             "level": "info",
@@ -3401,20 +3418,7 @@ def _start_auto_maintain() -> None:
                         "step": "pool_auto",
                     })
                     result = pm.probe_and_clean_sync()
-                    deleted_names = [name for name in (result.get("deleted_names") or []) if str(name).strip()]
-                    marked_local = 0
-                    for item in result.get("invalid") or []:
-                        name = str(item.get("name") or "").strip()
-                        if not name or name not in deleted_names:
-                            continue
-                        used_percent = item.get("used_percent")
-                        if _mark_local_token_status_by_email(
-                            name,
-                            status="cooling",
-                            next_check_at=datetime.now(timezone.utc),
-                            last_used_percent=used_percent,
-                        ):
-                            marked_local += 1
+                    marked_local = _mark_deleted_cpa_accounts_cooling(result)
                     total = result.get('total', 0)
                     candidates = result.get('candidates', 0)
                     invalid_count = result.get('invalid_count', 0)

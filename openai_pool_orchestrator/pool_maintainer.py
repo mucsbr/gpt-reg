@@ -8,7 +8,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +21,8 @@ from urllib.parse import quote
 import requests as _requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from . import TOKENS_DIR
 
 try:
     import aiohttp
@@ -98,6 +102,137 @@ class PoolMaintainer:
         self.used_percent_threshold = used_percent_threshold
         self.user_agent = user_agent
 
+    @staticmethod
+    def _extract_item_email(item: Dict[str, Any]) -> str:
+        for key in ("email", "account"):
+            value = str(item.get(key) or "").strip().lower()
+            if value and "@" in value:
+                return value
+        extra = item.get("extra")
+        if isinstance(extra, dict):
+            for key in ("email", "account"):
+                value = str(extra.get(key) or "").strip().lower()
+                if value and "@" in value:
+                    return value
+        name = str(item.get("name") or item.get("id") or "").strip().lower()
+        if name.endswith(".json"):
+            name = name[:-5]
+        return name if "@" in name else ""
+
+    @staticmethod
+    def _is_valid_local_token_json(token_data: Any, expected_email: str = "") -> bool:
+        if not isinstance(token_data, dict):
+            return False
+        email = str(token_data.get("email") or "").strip().lower()
+        refresh_token = str(token_data.get("refresh_token") or "").strip()
+        account_id = str(token_data.get("account_id") or token_data.get("chatgpt_account_id") or "").strip()
+        if not email or not refresh_token or not account_id:
+            return False
+        if expected_email and email != expected_email:
+            return False
+        return True
+
+    @staticmethod
+    def _build_local_token_filename(email: str) -> str:
+        safe_email = re.sub(r"[^A-Za-z0-9._-]+", "_", email.strip().lower()) or "unknown"
+        return f"token_{safe_email}_{time.time_ns()}.json"
+
+    @staticmethod
+    def _write_text_atomic(file_path: str, content: str) -> None:
+        directory = os.path.dirname(file_path) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, file_path)
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
+    def _find_local_token_file_by_email(self, account_email: str) -> Optional[str]:
+        email = str(account_email or "").strip().lower()
+        if not email or not TOKENS_DIR.is_dir():
+            return None
+        for path in TOKENS_DIR.iterdir():
+            if path.suffix.lower() != ".json" or not path.is_file():
+                continue
+            try:
+                token_data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(token_data, dict):
+                continue
+            token_email = str(token_data.get("email") or "").strip().lower()
+            if token_email == email:
+                return str(path)
+        return None
+
+    def _download_auth_file(self, name: str, timeout: int) -> Dict[str, Any]:
+        encoded = quote(name, safe="")
+        resp = _requests.get(
+            f"{self.base_url}/v0/management/auth-files/download?name={encoded}",
+            headers=_mgmt_headers(self.token),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        text = resp.text
+        data: Any = _safe_json(text)
+        if isinstance(data, str):
+            nested_data = _safe_json(data)
+            if isinstance(nested_data, dict) and self._is_valid_local_token_json(nested_data):
+                return nested_data
+        if isinstance(data, dict) and self._is_valid_local_token_json(data):
+            return data
+        for key in ("content", "data", "file", "auth_file"):
+            nested = data.get(key) if isinstance(data, dict) else None
+            if isinstance(nested, dict) and self._is_valid_local_token_json(nested):
+                return nested
+            if isinstance(nested, str):
+                nested_data = _safe_json(nested)
+                if isinstance(nested_data, dict) and self._is_valid_local_token_json(nested_data):
+                    return nested_data
+        return data if isinstance(data, dict) else {}
+
+    def _ensure_local_backup_before_delete(self, item: Dict[str, Any], timeout: int) -> Dict[str, Any]:
+        name = str(item.get("name") or "").strip()
+        email = str(item.get("email") or "").strip().lower()
+        if not name:
+            return {"ok": False, "reason": "missing name", "downloaded": False, "skipped_existing": False}
+        if email and self._find_local_token_file_by_email(email):
+            return {"ok": True, "reason": None, "downloaded": False, "skipped_existing": True}
+        try:
+            token_data = self._download_auth_file(name, timeout)
+        except Exception as e:
+            return {"ok": False, "reason": f"download failed: {e}", "downloaded": False, "skipped_existing": False}
+        if not self._is_valid_local_token_json(token_data, email):
+            return {"ok": False, "reason": "downloaded token invalid", "downloaded": False, "skipped_existing": False}
+        downloaded_email = str(token_data.get("email") or "").strip().lower()
+        if not downloaded_email:
+            return {"ok": False, "reason": "downloaded token missing email", "downloaded": False, "skipped_existing": False}
+        item["email"] = downloaded_email
+        if self._find_local_token_file_by_email(downloaded_email):
+            return {"ok": True, "reason": None, "downloaded": False, "skipped_existing": True}
+        file_name = self._build_local_token_filename(downloaded_email)
+        file_path = TOKENS_DIR / file_name
+        try:
+            self._write_text_atomic(str(file_path), json.dumps(token_data, ensure_ascii=False, indent=2))
+        except Exception as e:
+            return {"ok": False, "reason": f"write failed: {e}", "downloaded": False, "skipped_existing": False}
+        return {
+            "ok": True,
+            "reason": None,
+            "downloaded": True,
+            "skipped_existing": False,
+            "file_name": file_name,
+            "file_path": str(file_path),
+        }
+
     def fetch_auth_files(self, timeout: int = 15) -> List[Dict[str, Any]]:
         resp = _requests.get(
             f"{self.base_url}/v0/management/auth-files",
@@ -170,12 +305,15 @@ class PoolMaintainer:
         async def probe_one(session: aiohttp.ClientSession, item: Dict[str, Any]) -> Dict[str, Any]:
             auth_index = item.get("auth_index")
             name = item.get("name") or item.get("id")
+            email = self._extract_item_email(item)
             result = {
                 "name": name,
+                "email": email,
                 "auth_index": auth_index,
                 "invalid_401": False,
                 "invalid_used_percent": False,
                 "used_percent": None,
+                "is_non_free": False,
                 "error": None,
             }
             if not auth_index:
@@ -216,10 +354,15 @@ class PoolMaintainer:
                             if sc == 200:
                                 try:
                                     body_data = _safe_json(data.get("body", ""))
-                                    used_pct = (body_data.get("rate_limit", {}).get("primary_window", {}).get("used_percent"))
-                                    if used_pct is not None:
-                                        result["used_percent"] = used_pct
-                                        result["invalid_used_percent"] = used_pct >= self.used_percent_threshold
+                                    rate_limit = body_data.get("rate_limit", {}) if isinstance(body_data, dict) else {}
+                                    primary_window = rate_limit.get("primary_window", {}) if isinstance(rate_limit, dict) else {}
+                                    secondary_window = rate_limit.get("secondary_window") if isinstance(rate_limit, dict) else None
+                                    result["is_non_free"] = secondary_window is not None
+                                    if not result["is_non_free"]:
+                                        used_pct = primary_window.get("used_percent") if isinstance(primary_window, dict) else None
+                                        if used_pct is not None:
+                                            result["used_percent"] = used_pct
+                                            result["invalid_used_percent"] = used_pct >= self.used_percent_threshold
                                 except Exception:
                                     pass
                             return result
@@ -266,18 +409,38 @@ class PoolMaintainer:
 
         probe_result = await self.probe_accounts_async(workers, timeout, retries)
         invalid = probe_result["invalid"]
-        names = [str(r["name"]) for r in invalid if r.get("name")]
+        invalid_items = [item for item in invalid if str(item.get("name") or "").strip()]
 
         deleted_ok = 0
         deleted_fail = 0
+        deleted_ok_names: List[str] = []
+        deleted_names = [str(item.get("name") or "").strip() for item in invalid_items]
+        backup_failed_names: List[str] = []
+        backup_downloaded_names: List[str] = []
+        backup_skipped_existing_names: List[str] = []
 
-        if names:
+        deletable_items: List[Dict[str, Any]] = []
+        for item in invalid_items:
+            name = str(item.get("name") or "").strip()
+            backup_result = self._ensure_local_backup_before_delete(item, timeout)
+            if backup_result.get("ok"):
+                deletable_items.append(item)
+                if backup_result.get("downloaded"):
+                    backup_downloaded_names.append(name)
+                if backup_result.get("skipped_existing"):
+                    backup_skipped_existing_names.append(name)
+            else:
+                backup_failed_names.append(name)
+                item["backup_error"] = backup_result.get("reason")
+
+        if deletable_items:
             semaphore = asyncio.Semaphore(max(1, workers))
             connector = aiohttp.TCPConnector(limit=max(1, workers))
             client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
 
             async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-                async def do_delete(name: str) -> bool:
+                async def do_delete(item: Dict[str, Any]) -> Dict[str, Any]:
+                    name = str(item.get("name") or "").strip()
                     encoded = quote(name, safe="")
                     try:
                         async with semaphore:
@@ -288,16 +451,23 @@ class PoolMaintainer:
                             ) as resp:
                                 text = await resp.text()
                                 data = _safe_json(text)
-                                return resp.status == 200 and data.get("status") == "ok"
+                                ok = resp.status == 200 and data.get("status") == "ok"
+                                return {"name": name, "deleted": ok}
                     except Exception:
-                        return False
+                        return {"name": name, "deleted": False}
 
-                tasks = [asyncio.create_task(do_delete(n)) for n in names]
+                tasks = [asyncio.create_task(do_delete(item)) for item in deletable_items]
                 for task in asyncio.as_completed(tasks):
-                    if await task:
+                    result = await task
+                    name = str(result.get("name") or "").strip()
+                    if result.get("deleted"):
                         deleted_ok += 1
+                        if name:
+                            deleted_ok_names.append(name)
                     else:
                         deleted_fail += 1
+
+        deleted_fail += len(backup_failed_names)
 
         return {
             "total": probe_result["total"],
@@ -305,7 +475,11 @@ class PoolMaintainer:
             "invalid_count": len(invalid),
             "deleted_ok": deleted_ok,
             "deleted_fail": deleted_fail,
-            "deleted_names": names,
+            "deleted_names": deleted_names,
+            "deleted_ok_names": deleted_ok_names,
+            "backup_failed_names": backup_failed_names,
+            "backup_downloaded_names": backup_downloaded_names,
+            "backup_skipped_existing_names": backup_skipped_existing_names,
             "invalid": invalid,
         }
 
